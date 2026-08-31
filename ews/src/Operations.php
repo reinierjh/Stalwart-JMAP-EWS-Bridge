@@ -178,25 +178,27 @@ class EwsOperations {
 
             $prevState = $syncState ? json_decode(base64_decode($syncState), true) : null;
             $prevIds = $prevState['ids'] ?? [];
+            $prevPos = $prevState['pos'] ?? null;
 
             switch ($folderType) {
                 case 'contacts':
-                    [$changesXml, $currentIds] = $this->syncContacts($dom, $jmapId, $prevIds, $maxChanges);
+                    [$changesXml, $currentIds, $hasMore, $nextPos] = $this->syncContacts($dom, $jmapId, $prevIds, $prevPos, $maxChanges);
                     break;
                 case 'calendar':
-                    [$changesXml, $currentIds] = $this->syncCalendarEvents($dom, $jmapId, $prevIds, $maxChanges);
+                    [$changesXml, $currentIds, $hasMore, $nextPos] = $this->syncCalendarEvents($dom, $jmapId, $prevIds, $prevPos, $maxChanges);
                     break;
                 default:
-                    [$changesXml, $currentIds] = $this->syncEmails($dom, $jmapId, $prevIds, $maxChanges);
+                    [$changesXml, $currentIds, $hasMore, $nextPos] = $this->syncEmails($dom, $jmapId, $prevIds, $prevPos, $maxChanges);
                     break;
             }
 
-            $newSyncState = base64_encode(json_encode([
-                't' => time(),
-                'ids' => $currentIds,
-            ]));
+            $newState = ['t' => time(), 'ids' => $currentIds];
+            if ($nextPos !== null) {
+                $newState['pos'] = $nextPos;
+            }
+            $newSyncState = base64_encode(json_encode($newState));
 
-            $includesLast = 'true';
+            $includesLast = $hasMore ? 'false' : 'true';
 
             $bodyXml = '<m:SyncFolderItemsResponse>' .
                 '<m:ResponseMessages>' .
@@ -1211,18 +1213,24 @@ class EwsOperations {
         return EwsSoap::buildSoapResponse($bodyXml);
     }
 
-    private function syncEmails(DOMDocument $dom, string $mailboxId, array $prevIds, int $maxChanges): array {
+    private function syncEmails(DOMDocument $dom, string $mailboxId, array $prevIds, ?int $prevPos, int $maxChanges): array {
+        if ($prevPos !== null) {
+            return $this->emailDownloadPage($dom, $mailboxId, $prevPos, $maxChanges);
+        }
+
         $r = $this->client->call([
             ['Email/query', [
                 'accountId' => $this->accountId,
                 'filter'    => ['inMailbox' => $mailboxId],
                 'sort'      => [['property' => 'receivedAt', 'isAscending' => false]],
-                'limit'     => min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST),
+                'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
             ], 'q'],
         ]);
 
-        $currentIds = $r[0][1]['list'] ?? [];
-        $currentIds = array_column($currentIds, 'id');
+        $qRes = $r[0][1] ?? [];
+        $currentIds = $qRes['ids'] ?? [];
+        $hasMore = !empty($qRes['more']);
+        $nextPos = $hasMore ? ((int)($qRes['position'] ?? 0) + count($currentIds)) : null;
 
         if ($prevIds) {
             $deletedIds = array_diff($prevIds, $currentIds);
@@ -1258,32 +1266,64 @@ class EwsOperations {
                 }
             }
         } else {
-            $r2 = $this->client->call([
-                ['Email/get', [
-                    'accountId'          => $this->accountId,
-                    '#ids'               => ['resultOf' => 'q', 'name' => 'Email/query', 'path' => '/ids'],
-                    'properties'         => ['id', 'blobId', 'mailboxIds', 'keywords', 'size',
-                        'receivedAt', 'subject', 'from', 'to', 'hasAttachment'],
-                    'fetchAllBodyValues' => false,
-                ], 'g'],
-            ]);
-            $changesXml = '';
-            foreach ($r2[0][1]['list'] ?? [] as $email) {
-                $changesXml .= '<t:Create>' .
-                    EwsConverter::emailToXml($dom, $email, $mailboxId) .
-                    '</t:Create>';
-            }
+            $changesXml = $this->emailCreates($dom, $mailboxId, $currentIds);
         }
 
-        return [$changesXml, $currentIds];
+        return [$changesXml, $currentIds, $hasMore, $nextPos];
     }
 
-    private function syncContacts(DOMDocument $dom, string $abId, array $prevIds, int $maxChanges): array {
+    private function emailDownloadPage(DOMDocument $dom, string $mailboxId, int $position, int $maxChanges): array {
+        $r = $this->client->call([
+            ['Email/query', [
+                'accountId' => $this->accountId,
+                'filter'    => ['inMailbox' => $mailboxId],
+                'sort'      => [['property' => 'receivedAt', 'isAscending' => false]],
+                'position'  => $position,
+                'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
+            ], 'q'],
+        ]);
+
+        $qRes = $r[0][1] ?? [];
+        $currentIds = $qRes['ids'] ?? [];
+        $hasMore = !empty($qRes['more']);
+        $nextPos = $hasMore ? ((int)($qRes['position'] ?? $position) + count($currentIds)) : null;
+
+        $changesXml = $this->emailCreates($dom, $mailboxId, $currentIds);
+        return [$changesXml, $currentIds, $hasMore, $nextPos];
+    }
+
+    private function emailCreates(DOMDocument $dom, string $mailboxId, array $ids): string {
+        if (!$ids) {
+            return '';
+        }
+        $r2 = $this->client->call([
+            ['Email/get', [
+                'accountId'          => $this->accountId,
+                'ids'                => array_values($ids),
+                'properties'         => ['id', 'blobId', 'mailboxIds', 'keywords', 'size',
+                    'receivedAt', 'subject', 'from', 'to', 'hasAttachment'],
+                'fetchAllBodyValues' => false,
+            ], 'g'],
+        ]);
+        $changesXml = '';
+        foreach ($r2[0][1]['list'] ?? [] as $email) {
+            $changesXml .= '<t:Create>' .
+                EwsConverter::emailToXml($dom, $email, $mailboxId) .
+                '</t:Create>';
+        }
+        return $changesXml;
+    }
+
+    private function syncContacts(DOMDocument $dom, string $abId, array $prevIds, ?int $prevPos, int $maxChanges): array {
+        if ($prevPos !== null) {
+            return $this->contactDownloadPage($dom, $abId, $prevPos, $maxChanges);
+        }
+
         $r = $this->client->call([
             ['ContactCard/query', [
                 'accountId' => $this->accountId,
                 'filter'    => ['inAddressBook' => $abId],
-                'limit'     => min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST),
+                'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
             ], 'q'],
             ['ContactCard/get', [
                 'accountId'  => $this->accountId,
@@ -1292,8 +1332,11 @@ class EwsOperations {
             ], 'g'],
         ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
 
+        $qRes = $r[0][1] ?? [];
         $cards = $r[1][1]['list'] ?? [];
         $currentIds = array_column($cards, 'id');
+        $hasMore = !empty($qRes['more']);
+        $nextPos = $hasMore ? ((int)($qRes['position'] ?? 0) + count($currentIds)) : null;
         $folderId = EwsConverter::PFX_CONTACTS . $abId;
         $changesXml = '';
 
@@ -1327,16 +1370,52 @@ class EwsOperations {
             }
         }
 
-        return [$changesXml, $currentIds];
+        return [$changesXml, $currentIds, $hasMore, $nextPos];
     }
 
-    private function syncCalendarEvents(DOMDocument $dom, string $calId, array $prevIds, int $maxChanges): array {
+    private function contactDownloadPage(DOMDocument $dom, string $abId, int $position, int $maxChanges): array {
+        $r = $this->client->call([
+            ['ContactCard/query', [
+                'accountId' => $this->accountId,
+                'filter'    => ['inAddressBook' => $abId],
+                'position'  => $position,
+                'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
+            ], 'q'],
+            ['ContactCard/get', [
+                'accountId'  => $this->accountId,
+                '#ids'       => ['resultOf' => 'q', 'name' => 'ContactCard/query', 'path' => '/ids'],
+                'properties' => null,
+            ], 'g'],
+        ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
+
+        $qRes = $r[0][1] ?? [];
+        $cards = $r[1][1]['list'] ?? [];
+        $currentIds = array_column($cards, 'id');
+        $hasMore = !empty($qRes['more']);
+        $nextPos = $hasMore ? ((int)($qRes['position'] ?? $position) + count($currentIds)) : null;
+        $folderId = EwsConverter::PFX_CONTACTS . $abId;
+
+        $changesXml = '';
+        foreach ($cards as $card) {
+            $changesXml .= '<t:Create>' .
+                EwsConverter::contactToXml($dom, $card, $folderId) .
+                '</t:Create>';
+        }
+
+        return [$changesXml, $currentIds, $hasMore, $nextPos];
+    }
+
+    private function syncCalendarEvents(DOMDocument $dom, string $calId, array $prevIds, ?int $prevPos, int $maxChanges): array {
+        if ($prevPos !== null) {
+            return $this->calendarDownloadPage($dom, $calId, $prevPos, $maxChanges);
+        }
+
         $r = $this->client->call([
             ['CalendarEvent/query', [
                 'accountId' => $this->accountId,
                 'filter'    => ['inCalendar' => $calId],
                 'sort'      => [['property' => 'start', 'isAscending' => false]],
-                'limit'     => min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST),
+                'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
             ], 'q'],
             ['CalendarEvent/get', [
                 'accountId'  => $this->accountId,
@@ -1345,8 +1424,11 @@ class EwsOperations {
             ], 'g'],
         ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
 
+        $qRes = $r[0][1] ?? [];
         $events = $r[1][1]['list'] ?? [];
         $currentIds = array_column($events, 'id');
+        $hasMore = !empty($qRes['more']);
+        $nextPos = $hasMore ? ((int)($qRes['position'] ?? 0) + count($currentIds)) : null;
         $folderId = EwsConverter::PFX_CALENDAR . $calId;
         $changesXml = '';
 
@@ -1380,7 +1462,40 @@ class EwsOperations {
             }
         }
 
-        return [$changesXml, $currentIds];
+        return [$changesXml, $currentIds, $hasMore, $nextPos];
+    }
+
+    private function calendarDownloadPage(DOMDocument $dom, string $calId, int $position, int $maxChanges): array {
+        $r = $this->client->call([
+            ['CalendarEvent/query', [
+                'accountId' => $this->accountId,
+                'filter'    => ['inCalendar' => $calId],
+                'sort'      => [['property' => 'start', 'isAscending' => false]],
+                'position'  => $position,
+                'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
+            ], 'q'],
+            ['CalendarEvent/get', [
+                'accountId'  => $this->accountId,
+                '#ids'       => ['resultOf' => 'q', 'name' => 'CalendarEvent/query', 'path' => '/ids'],
+                'properties' => null,
+            ], 'g'],
+        ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
+
+        $qRes = $r[0][1] ?? [];
+        $events = $r[1][1]['list'] ?? [];
+        $currentIds = array_column($events, 'id');
+        $hasMore = !empty($qRes['more']);
+        $nextPos = $hasMore ? ((int)($qRes['position'] ?? $position) + count($currentIds)) : null;
+        $folderId = EwsConverter::PFX_CALENDAR . $calId;
+
+        $changesXml = '';
+        foreach ($events as $event) {
+            $changesXml .= '<t:Create>' .
+                EwsConverter::calendarToXml($dom, $event, $folderId) .
+                '</t:Create>';
+        }
+
+        return [$changesXml, $currentIds, $hasMore, $nextPos];
     }
 
     private function logSync(string $msg): void {

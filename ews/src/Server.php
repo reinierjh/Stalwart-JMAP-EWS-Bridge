@@ -183,7 +183,7 @@ class EwsServer {
                 'Subscribe'              => $this->emptySuccessResponse($operation),
                 'GetEvents'              => $this->getEventsResponse(),
                 'Unsubscribe'            => $this->emptySuccessResponse($operation),
-                'GetStreamingEvents'     => $this->getStreamingEventsResponse(),
+                'GetStreamingEvents'     => $this->getStreamingEventsResponse($opElement),
                 default                  => $this->unknownOperationResponse($operation),
             };
 
@@ -237,14 +237,35 @@ class EwsServer {
         return EwsSoap::buildSoapResponse($bodyXml);
     }
 
-    private function getStreamingEventsResponse(): string {
+    private function getStreamingEventsResponse(?DOMElement $request = null): string {
+        $subscriptionId = '00000000-0000-0000-0000-000000000000';
+        $timeout = 30;
+
+        if ($request) {
+            $m = $request->getElementsByTagNameNS('http://schemas.microsoft.com/exchange/services/2006/messages', 'ConnectionTimeout');
+            if ($m->length) {
+                $t = (int)trim($m->item(0)->textContent);
+                if ($t > 0 && $t <= 120) {
+                    $timeout = $t;
+                }
+            }
+            $sid = $request->getElementsByTagNameNS('http://schemas.microsoft.com/exchange/services/2006/types', 'SubscriptionId');
+            if ($sid->length) {
+                $subscriptionId = trim($sid->item(0)->textContent);
+            }
+        }
+
+        if ($timeout > 0) {
+            sleep($timeout);
+        }
+
         $bodyXml = '<m:GetStreamingEventsResponse>' .
             '<m:ResponseMessages>' .
             '<m:GetStreamingEventsResponseMessage ResponseClass="Success">' .
             '<m:ResponseCode>NoError</m:ResponseCode>' .
             '<m:Notifications>' .
             '<t:Notification>' .
-            '<t:SubscriptionId>00000000-0000-0000-0000-000000000000</t:SubscriptionId>' .
+            '<t:SubscriptionId>' . EwsSoap::escapeXml($subscriptionId) . '</t:SubscriptionId>' .
             '<t:MoreEvents>false</t:MoreEvents>' .
             '</t:Notification>' .
             '</m:Notifications>' .
