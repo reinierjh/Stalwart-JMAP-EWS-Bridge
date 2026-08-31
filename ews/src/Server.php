@@ -155,7 +155,8 @@ class EwsServer {
         $opElement = EwsSoap::getOperationElement($body);
 
         $opXml = $opElement ? $opElement->ownerDocument->saveXML($opElement) : 'null';
-        $this->logDebug("EWS operation: $operation, request=" . substr($opXml, 0, 300));
+        $this->logDebug("EWS operation: $operation");
+        $this->logDebug("EWS request (full): " . substr($rawBody, 0, 4000));
 
         $ops = new EwsOperations($client);
 
@@ -186,11 +187,8 @@ class EwsServer {
                 default                  => $this->unknownOperationResponse($operation),
             };
 
-            if ($operation === 'GetFolder') {
-                $this->logDebug("EWS response: " . $operation . " (" . strlen($response) . " bytes) body=" . $response);
-            } else {
-                $this->logDebug("EWS response: " . $operation . " (" . strlen($response) . " bytes)");
-            }
+            $this->logDebug("EWS response: " . $operation . " (" . strlen($response) . " bytes)");
+            $this->logDebug("EWS response body: " . substr($response, 0, 4000));
             echo $response;
         } catch (\Throwable $e) {
             $this->logError("Operation $operation failed: " . $e->getMessage());
