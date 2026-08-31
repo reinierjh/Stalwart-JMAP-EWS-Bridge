@@ -183,7 +183,7 @@ class EwsServer {
                 'Subscribe'              => $this->emptySuccessResponse($operation),
                 'GetEvents'              => $this->getEventsResponse(),
                 'Unsubscribe'            => $this->emptySuccessResponse($operation),
-                'GetStreamingEvents'     => $this->emptySuccessResponse($operation),
+                'GetStreamingEvents'     => $this->getStreamingEventsResponse(),
                 default                  => $this->unknownOperationResponse($operation),
             };
 
@@ -234,6 +234,24 @@ class EwsServer {
             '</m:GetEventsResponseMessage>' .
             '</m:ResponseMessages>' .
             '</m:GetEventsResponse>';
+        return EwsSoap::buildSoapResponse($bodyXml);
+    }
+
+    private function getStreamingEventsResponse(): string {
+        $bodyXml = '<m:GetStreamingEventsResponse>' .
+            '<m:ResponseMessages>' .
+            '<m:GetStreamingEventsResponseMessage ResponseClass="Success">' .
+            '<m:ResponseCode>NoError</m:ResponseCode>' .
+            '<m:Notifications>' .
+            '<t:Notification>' .
+            '<t:SubscriptionId>00000000-0000-0000-0000-000000000000</t:SubscriptionId>' .
+            '<t:MoreEvents>false</t:MoreEvents>' .
+            '</t:Notification>' .
+            '</m:Notifications>' .
+            '<m:ConnectionStatus>OK</m:ConnectionStatus>' .
+            '</m:GetStreamingEventsResponseMessage>' .
+            '</m:ResponseMessages>' .
+            '</m:GetStreamingEventsResponse>';
         return EwsSoap::buildSoapResponse($bodyXml);
     }
 

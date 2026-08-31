@@ -196,7 +196,7 @@ class EwsOperations {
                 'ids' => $currentIds,
             ]));
 
-            $includesLast = $changesXml ? 'false' : 'true';
+            $includesLast = 'true';
 
             $bodyXml = '<m:SyncFolderItemsResponse>' .
                 '<m:ResponseMessages>' .
@@ -1227,6 +1227,12 @@ class EwsOperations {
         if ($prevIds) {
             $deletedIds = array_diff($prevIds, $currentIds);
             $createdIds = array_diff($currentIds, $prevIds);
+
+            $this->logSync("emails mailbox=$mailboxId prev=" . json_encode($prevIds) .
+                " current=" . json_encode($currentIds) .
+                " deleted=" . json_encode(array_values($deletedIds)) .
+                " created=" . json_encode(array_values($createdIds)));
+
             $changesXml = '';
 
             foreach ($deletedIds as $delId) {
@@ -1295,6 +1301,11 @@ class EwsOperations {
             $deletedIds = array_diff($prevIds, $currentIds);
             $createdIds = array_diff($currentIds, $prevIds);
 
+            $this->logSync("contacts ab=$abId prev=" . json_encode($prevIds) .
+                " current=" . json_encode($currentIds) .
+                " deleted=" . json_encode(array_values($deletedIds)) .
+                " created=" . json_encode(array_values($createdIds)));
+
             foreach ($deletedIds as $delId) {
                 $changesXml .= '<t:Delete>' .
                     '<t:ItemId Id="' . EwsSoap::escapeXml($delId) . '" ChangeKey="' . EwsSoap::escapeXml($delId) . '"/>' .
@@ -1343,6 +1354,11 @@ class EwsOperations {
             $deletedIds = array_diff($prevIds, $currentIds);
             $createdIds = array_diff($currentIds, $prevIds);
 
+            $this->logSync("calendar cal=$calId prev=" . json_encode($prevIds) .
+                " current=" . json_encode($currentIds) .
+                " deleted=" . json_encode(array_values($deletedIds)) .
+                " created=" . json_encode(array_values($createdIds)));
+
             foreach ($deletedIds as $delId) {
                 $changesXml .= '<t:Delete>' .
                     '<t:ItemId Id="' . EwsSoap::escapeXml($delId) . '" ChangeKey="' . EwsSoap::escapeXml($delId) . '"/>' .
@@ -1365,6 +1381,12 @@ class EwsOperations {
         }
 
         return [$changesXml, $currentIds];
+    }
+
+    private function logSync(string $msg): void {
+        if (defined('LOGLEVEL_DEBUG')) {
+            error_log('[EWS-SYNC] ' . $msg);
+        }
     }
 
     private function updateContact(string $id, DOMElement $updates): string {
