@@ -1,0 +1,9 @@
+RewriteEngine On
+
+# Skip real files and directories
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Route all /EWS/* and /Autodiscover/* requests to the front controller
+RewriteRule ^(EWS|ews)/ index.php [L,QSA]
+RewriteRule ^(Autodiscover|autodiscover)/ index.php [L,QSA]
