@@ -167,6 +167,12 @@ class EwsOperations {
             $syncState    = EwsSoap::getChildValue($request, 'SyncState');
             $maxChanges   = EwsSoap::getChildInt($request, 'MaxChangesReturned', 512);
 
+            if (!defined('EWS_SYNC_PAGE_MAX')) {
+                define('EWS_SYNC_PAGE_MAX', 100);
+            }
+            $pageMax = (int)EWS_SYNC_PAGE_MAX;
+            $maxChanges = max(1, min($maxChanges, $pageMax));
+
             if (!$syncFolderId) {
                 return $this->errorResponse('SyncFolderItems', 'ErrorInvalidSyncFolderId', 'Missing SyncFolderId');
             }
