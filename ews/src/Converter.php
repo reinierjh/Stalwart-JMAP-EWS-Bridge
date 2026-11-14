@@ -1,5 +1,7 @@
 <?php
 
+class EwsCalendarSafetyException extends DomainException {}
+
 class EwsConverter {
 
     const PFX_CONTACTS = 'ab_';
@@ -217,7 +219,6 @@ class EwsConverter {
             foreach ($cats as $cat) $xml .= '<t:String>' . EwsSoap::escapeXml((string)$cat) . '</t:String>';
             $xml .= '</t:Categories>';
         }
-
         $parts       = self::contactNameParts($name);
         $given       = $parts['given'];
         $surname     = $parts['surname'];
@@ -245,7 +246,7 @@ class EwsConverter {
             $xml .= '<t:CompanyName>' . EwsSoap::escapeXml($orgs[0]['name']) . '</t:CompanyName>';
         }
 
-        $emails = array_values($card['emails'] ?? []);
+        $emails = self::sortedContactEntries($card['emails'] ?? []);
         usort($emails, fn($a, $b) => (int)(($b['contexts']['work'] ?? false) === true) - (int)(($a['contexts']['work'] ?? false) === true));
         $emailEntries = '';
         $emailIndex = 1;
@@ -258,7 +259,7 @@ class EwsConverter {
         if ($emailEntries !== '') $xml .= '<t:EmailAddresses>' . $emailEntries . '</t:EmailAddresses>';
 
         $addresses = [];
-        foreach (array_values($card['addresses'] ?? []) as $addr) {
+        foreach (self::sortedContactEntries($card['addresses'] ?? []) as $addr) {
             $ctx = $addr['contexts'] ?? [];
             $key = ($ctx['work'] ?? false) === true ? 'Business' : ((($ctx['home'] ?? false) === true || ($ctx['private'] ?? false) === true) ? 'Home' : 'Other');
             if (isset($addresses[$key])) continue;
@@ -272,7 +273,7 @@ class EwsConverter {
         if ($addresses) $xml .= '<t:PhysicalAddresses>' . implode('', $addresses) . '</t:PhysicalAddresses>';
 
         $phones = [];
-        foreach (array_values($card['phones'] ?? []) as $p) {
+        foreach (self::sortedContactEntries($card['phones'] ?? []) as $p) {
             $num    = $p['number'] ?? null;
             if (!is_string($num) || $num === '') continue;
             $ctx    = $p['contexts'] ?? [];
@@ -317,7 +318,7 @@ class EwsConverter {
         if ($depts && !empty($depts[0]['name'])) $xml .= '<t:Department>' . EwsSoap::escapeXml($depts[0]['name']) . '</t:Department>';
         $imEntries = '';
         $imIndex = 1;
-        foreach (array_values($card['onlineServices'] ?? []) as $im) {
+        foreach (self::sortedContactEntries($card['onlineServices'] ?? []) as $im) {
             $uri = $im['uri'] ?? null;
             if (!is_string($uri) || !preg_match('/^(?:im|xmpp|sip|sips|matrix):/i', $uri)) continue;
             if ($imIndex > 3) break;
@@ -333,15 +334,18 @@ class EwsConverter {
         return $xml;
     }
 
+    /** JMAP maps are unordered; sort original entry IDs before assigning EWS slots. */
+    private static function sortedContactEntries(array $entries): array {
+        ksort($entries, SORT_STRING);
+        return array_values($entries);
+    }
+
     public static function calendarToXml(DOMDocument $dom, array $event, ?string $folderId): string {
+        if (array_key_exists('status', $event) && $event['status'] !== null && $event['status'] !== 'confirmed') throw new EwsCalendarSafetyException('Unsupported calendar event status');
+        [$startTs, $endTs, $zoneId, $allDay] = self::calendarReadTimes($event);
+        $recurrence = self::calendarRecurrenceXml($event, $startTs, $endTs, $allDay);
         $id        = $event['id'] ?? '';
         $changeKey = self::itemChangeKey($event);
-
-        $startRaw  = $event['start'] ?? '';
-        $startTs   = JmapCalendarConverter::jmapTimeToTimestamp($startRaw);
-        $durSecs   = JmapCalendarConverter::parseDuration($event['duration'] ?? 'PT1H');
-        $endTs     = $startTs + $durSecs;
-        $allDay    = !empty($event['showWithoutTime']);
 
         $xml = '<t:CalendarItem>';
         $xml .= EwsSoap::buildId($dom, self::PFX_CALENDAR . $id, $changeKey);
@@ -350,67 +354,303 @@ class EwsConverter {
         }
 
         $xml .= '<t:Subject>' . EwsSoap::escapeXml($event['title'] ?? '(No Subject)') . '</t:Subject>';
-        $xml .= '<t:Start>' . gmdate('Y-m-d\TH:i:s\Z', $startTs) . '</t:Start>';
-        $xml .= '<t:End>' . gmdate('Y-m-d\TH:i:s\Z', $endTs) . '</t:End>';
-        $xml .= '<t:IsAllDayEvent>' . ($allDay ? 'true' : 'false') . '</t:IsAllDayEvent>';
-        $xml .= '<t:CalendarItemType>' . ($allDay ? 'Single' : 'Single') . '</t:CalendarItemType>';
-
-        $locs = array_values($event['locations'] ?? []);
-        if ($locs) {
-            $xml .= '<t:Location>' . EwsSoap::escapeXml($locs[0]['name'] ?? '') . '</t:Location>';
-        }
-
-        if (!empty($event['description'])) {
-            $xml .= '<t:Body BodyType="Text">' . EwsSoap::escapeXml($event['description']) . '</t:Body>';
-        }
-
-        $participants = $event['participants'] ?? [];
-        foreach ($participants as $p) {
-            $roles = $p['roles'] ?? [];
-            if (isset($roles['organizer'])) {
-                $xml .= '<t:Organizer>' . EwsSoap::buildMailbox($p['name'] ?? '', $p['email'] ?? $p['sendTo']['imip'] ?? '') . '</t:Organizer>';
-            } else {
-                $attType = 'RequiredAttendees';
-                if (isset($roles['optional']))      $attType = 'OptionalAttendees';
-                if (isset($roles['informational'])) $attType = 'Resources';
-                $xml .= '<t:' . $attType . '>' . EwsSoap::buildMailbox($p['name'] ?? '', $p['email'] ?? $p['sendTo']['imip'] ?? '') . '</t:' . $attType . '>';
-            }
-        }
-
         $xml .= '<t:Sensitivity>' . match($event['privacy'] ?? 'public') {
-            'private' => 'Private',
-            'confidential', 'secret' => 'Confidential',
-            default    => 'Normal',
+            'private' => 'Private', 'public' => 'Normal',
+            default => throw new EwsCalendarSafetyException('Unsupported calendar privacy'),
         } . '</t:Sensitivity>';
-
-        $xml .= '<t:LegacyFreeBusyStatus>' . match($event['freeBusyStatus'] ?? 'busy') {
-            'free'        => 'Free',
-            'tentative'   => 'Tentative',
-            'unavailable' => 'OutOfOffice',
-            default       => 'Busy',
-        } . '</t:LegacyFreeBusyStatus>';
-
-        foreach ($event['alerts'] ?? [] as $alert) {
-            $offset = $alert['trigger']['offset'] ?? null;
-            if ($offset && str_starts_with($offset, '-')) {
-                $secs = JmapCalendarConverter::parseDuration(ltrim($offset, '-'));
-                $xml .= '<t:ReminderMinutesBeforeStart>' . max(0, intdiv($secs, 60)) . '</t:ReminderMinutesBeforeStart>';
-                $xml .= '<t:IsReminderSet>true</t:IsReminderSet>';
-                break;
-            }
+        if (!empty($event['description'])) {
+            $contentType = $event['descriptionContentType'] ?? 'text/plain';
+            if (!in_array($contentType, ['text/plain', 'text/html'], true)) throw new EwsCalendarSafetyException('Unsupported calendar description content type');
+            $xml .= '<t:Body BodyType="' . ($contentType === 'text/html' ? 'HTML' : 'Text') . '">' . EwsSoap::escapeXml($event['description']) . '</t:Body>';
         }
-
         $cats = array_keys($event['categories'] ?? []);
         if ($cats) {
             $xml .= '<t:Categories>';
-            foreach ($cats as $cat) {
-                $xml .= '<t:String>' . EwsSoap::escapeXml($cat) . '</t:String>';
-            }
+            foreach ($cats as $cat) $xml .= '<t:String>' . EwsSoap::escapeXml((string)$cat) . '</t:String>';
             $xml .= '</t:Categories>';
         }
+        $alerts = $event['alerts'] ?? [];
+        if ($alerts instanceof stdClass) $alerts = get_object_vars($alerts);
+        if (!is_array($alerts)) throw new EwsCalendarSafetyException('Unsupported calendar alerts');
+        if ($alerts) {
+            if (count($alerts) !== 1) throw new EwsCalendarSafetyException('Multiple calendar alerts are not supported');
+            $alert = reset($alerts);
+            if ($alert instanceof stdClass) $alert = get_object_vars($alert);
+            if (!is_array($alert) || array_diff(array_keys($alert), ['@type', 'action', 'trigger']) || (isset($alert['@type']) && $alert['@type'] !== 'Alert') || ($alert['action'] ?? null) !== 'display') throw new EwsCalendarSafetyException('Unsupported calendar alert');
+            $trigger = $alert['trigger'] ?? null;
+            if ($trigger instanceof stdClass) $trigger = get_object_vars($trigger);
+            if (!is_array($trigger) || array_diff(array_keys($trigger), ['@type', 'relativeTo', 'offset']) || ($trigger['@type'] ?? null) !== 'OffsetTrigger' || ($trigger['relativeTo'] ?? 'start') !== 'start' || !is_string($trigger['offset'] ?? null) || !preg_match('/^-PT(?:(\d{1,3})H)?(?:(\d{1,3})M)?(?:(\d{1,3})S)?$/D', $trigger['offset'], $offset) || $trigger['offset'] === '-PT') throw new EwsCalendarSafetyException('Unsupported calendar alert trigger');
+            $seconds = (int)($offset[1] ?? 0) * 3600 + (int)($offset[2] ?? 0) * 60 + (int)($offset[3] ?? 0);
+            if ($seconds % 60 !== 0) throw new EwsCalendarSafetyException('Sub-minute calendar alert is not supported');
+            $xml .= '<t:ReminderIsSet>true</t:ReminderIsSet><t:ReminderMinutesBeforeStart>' . intdiv($seconds, 60) . '</t:ReminderMinutesBeforeStart>';
+        }
+        if (is_string($event['uid'] ?? null) && $event['uid'] !== '') $xml .= '<t:UID>' . EwsSoap::escapeXml($event['uid']) . '</t:UID>';
+        $xml .= '<t:Start>' . gmdate('Y-m-d\TH:i:s\Z', $startTs) . '</t:Start>';
+        $xml .= '<t:End>' . gmdate('Y-m-d\TH:i:s\Z', $endTs) . '</t:End>';
+        $xml .= '<t:IsAllDayEvent>' . ($allDay ? 'true' : 'false') . '</t:IsAllDayEvent>';
+        $xml .= '<t:LegacyFreeBusyStatus>' . match($event['freeBusyStatus'] ?? 'busy') {
+            'free' => 'Free', 'tentative' => 'Tentative', 'unavailable' => 'OutOfOffice', default => 'Busy',
+        } . '</t:LegacyFreeBusyStatus>';
+
+        $locs = $event['locations'] ?? [];
+        if ($locs instanceof stdClass) $locs = get_object_vars($locs);
+        if (!is_array($locs)) throw new EwsCalendarSafetyException('Invalid calendar locations');
+        $mainLocationId = $event['mainLocationId'] ?? null;
+        if ($mainLocationId !== null) {
+            if (!is_string($mainLocationId) || !isset($locs[$mainLocationId])) throw new EwsCalendarSafetyException('Invalid main calendar location');
+            $location = $locs[$mainLocationId];
+        } elseif (count($locs) > 1) {
+            throw new EwsCalendarSafetyException('Multiple calendar locations without a main location');
+        } else {
+            $location = $locs ? reset($locs) : null;
+        }
+        if ($location instanceof stdClass) $location = get_object_vars($location);
+        if ($location !== null && (!is_array($location) || (isset($location['name']) && !is_string($location['name'])))) throw new EwsCalendarSafetyException('Invalid calendar location');
+        if ($mainLocationId !== null && (!isset($location['name']) || $location['name'] === '')) throw new EwsCalendarSafetyException('Main calendar location has no name');
+        if (isset($location['name']) && $location['name'] !== '') $xml .= '<t:Location>' . EwsSoap::escapeXml($location['name']) . '</t:Location>';
+
+        $xml .= '<t:CalendarItemType>' . ($recurrence !== '' ? 'RecurringMaster' : 'Single') . '</t:CalendarItemType>';
+        $xml .= self::calendarParticipantsXml($event);
+        $xml .= $recurrence;
+        $xml .= '<t:StartTimeZone Id="' . $zoneId . '"/><t:EndTimeZone Id="' . $zoneId . '"/>';
 
         $xml .= '</t:CalendarItem>';
         return $xml;
+    }
+
+    /** JSCalendar 2.0 organizer identity is an address, not a participant role. */
+    private static function calendarParticipantsXml(array $event): string {
+        $participants = $event['participants'] ?? [];
+        if ($participants instanceof stdClass) $participants = get_object_vars($participants);
+        if (!is_array($participants)) throw new EwsCalendarSafetyException('Invalid calendar participants');
+        $organizerAddress = $event['organizerCalendarAddress'] ?? null;
+        if ($organizerAddress !== null) self::calendarMailboxAddress($organizerAddress);
+        if ($participants && $organizerAddress === null) throw new EwsCalendarSafetyException('Calendar organizer address is missing');
+        $organizer = '';
+        $attendees = ['RequiredAttendees' => '', 'OptionalAttendees' => ''];
+        $addresses = [];
+        foreach ($participants as $participant) {
+            if ($participant instanceof stdClass) $participant = get_object_vars($participant);
+            if (!is_array($participant) || array_diff(array_keys($participant), ['@type', 'name', 'email', 'calendarAddress', 'kind', 'roles', 'participationStatus'])) throw new EwsCalendarSafetyException('Unsupported calendar participant');
+            if (array_key_exists('@type', $participant) && $participant['@type'] !== 'Participant') throw new EwsCalendarSafetyException('Invalid calendar participant type');
+            $address = $participant['calendarAddress'] ?? null;
+            $email = self::calendarMailboxAddress($address);
+            if (isset($addresses[$address])) throw new EwsCalendarSafetyException('Duplicate calendar participant address');
+            $addresses[$address] = true;
+            if (array_key_exists('email', $participant) && $participant['email'] !== $email) throw new EwsCalendarSafetyException('Distinct participant contact email is not supported');
+            if (array_key_exists('kind', $participant) && $participant['kind'] !== 'individual') throw new EwsCalendarSafetyException('Unsupported participant kind');
+            $name = $participant['name'] ?? '';
+            if (!is_string($name)) throw new EwsCalendarSafetyException('Invalid participant name');
+            $roles = $participant['roles'] ?? [];
+            if ($roles instanceof stdClass) $roles = get_object_vars($roles);
+            if (!is_array($roles)) throw new EwsCalendarSafetyException('Invalid participant roles');
+            foreach ($roles as $role => $enabled) {
+                if (!in_array($role, ['owner', 'required', 'optional'], true) || $enabled !== true) throw new EwsCalendarSafetyException('Unsupported participant role');
+            }
+            if (isset($roles['required'], $roles['optional'])) throw new EwsCalendarSafetyException('Multiple participant attendance roles are not supported');
+            $isOrganizer = $organizerAddress !== null && $address === $organizerAddress;
+            if (!$isOrganizer && isset($roles['owner'])) throw new EwsCalendarSafetyException('Non-organizer owner is not supported');
+            $mailbox = EwsSoap::buildMailbox($name, $email);
+            if ($isOrganizer) {
+                if ($organizer !== '') throw new EwsCalendarSafetyException('Multiple calendar organizers are not supported');
+                $organizer = '<t:Organizer>' . $mailbox . '</t:Organizer>';
+            }
+            // Organizer-only entries have no attendee-specific role or status.
+            if ($isOrganizer && !isset($roles['required']) && !isset($roles['optional']) && !array_key_exists('participationStatus', $participant)) continue;
+            $status = array_key_exists('participationStatus', $participant) ? $participant['participationStatus'] : 'needs-action';
+            $response = match($status) {
+                'accepted' => 'Accept', 'tentative' => 'Tentative', 'declined' => 'Decline', 'needs-action' => 'NoResponseReceived',
+                default => throw new EwsCalendarSafetyException('Unsupported participant status'),
+            };
+            $tag = isset($roles['optional']) ? 'OptionalAttendees' : 'RequiredAttendees';
+            $attendees[$tag] .= '<t:Attendee>' . $mailbox . '<t:ResponseType>' . $response . '</t:ResponseType></t:Attendee>';
+        }
+        if ($organizerAddress !== null && $organizer === '') throw new EwsCalendarSafetyException('Calendar organizer does not match a participant');
+        $xml = $organizer;
+        foreach ($attendees as $tag => $items) if ($items !== '') $xml .= '<t:' . $tag . '>' . $items . '</t:' . $tag . '>';
+        return $xml;
+    }
+
+    /** Restrict CAL-ADDRESS to a single unambiguous mailto mailbox. */
+    private static function calendarMailboxAddress($address): string {
+        if (!is_string($address) || !preg_match('/^mailto:([^?&#%,]+)$/iD', $address, $match) || filter_var($match[1], FILTER_VALIDATE_EMAIL) === false) throw new EwsCalendarSafetyException('Unsupported participant calendar address');
+        return $match[1];
+    }
+
+    /** Read-only conversion; safeCalendarTimes remains the stricter write guard. */
+    private static function calendarReadTimes(array $event): array {
+        foreach (['recurrenceRules', 'recurrenceOverrides', 'excludedRecurrenceRules', 'timeZones'] as $key) {
+            $value = $event[$key] ?? null;
+            if ($value !== null && $value !== [] && !($value instanceof stdClass && get_object_vars($value) === [])) throw new EwsCalendarSafetyException('Unsupported calendar ' . $key);
+        }
+        foreach (['recurrenceId', 'recurrenceIdTimeZone', 'baseEventId'] as $key) if (array_key_exists($key, $event) && $event[$key] !== null) throw new EwsCalendarSafetyException('Calendar occurrence is not supported');
+        if (!empty($event['relatedTo'])) throw new EwsCalendarSafetyException('Calendar relationship is not supported');
+        // CLDR windowsZones: NL/Europe/Amsterdam, ZZ/Etc/UTC.
+        $zones = ['UTC' => 'UTC', 'Etc/UTC' => 'UTC', 'Europe/Amsterdam' => 'W. Europe Standard Time'];
+        $name = $event['timeZone'] ?? null;
+        if (!is_string($name) || !isset($zones[$name])) throw new EwsCalendarSafetyException('Floating or unmapped calendar time zone');
+        if (isset($event['endTimeZone']) && $event['endTimeZone'] !== $name) throw new EwsCalendarSafetyException('Different end time zone is not supported');
+        $zone = new DateTimeZone($name);
+        $start = $event['start'] ?? null;
+        if (!is_string($start)) throw new EwsCalendarSafetyException('Invalid calendar start');
+        $wall = self::utcTime($start, false);
+        if ($name === 'Europe/Amsterdam' && substr($start, 0, 4) < '1970') throw new EwsCalendarSafetyException('Historical Amsterdam time zone mapping is not supported');
+        $startTs = self::calendarWallToUtc($wall, $zone);
+        $allDay = $event['showWithoutTime'] ?? false;
+        if (!is_bool($allDay)) throw new EwsCalendarSafetyException('Invalid all-day flag');
+        $duration = $event['duration'] ?? null;
+        if (!is_string($duration) || !preg_match('/^P(?:(\d{1,3})W)?(?:(\d{1,3})D)?(?:T(?:(\d{1,3})H)?(?:(\d{1,3})M)?(?:(\d{1,3})S)?)?$/D', $duration, $m) || $duration === 'P' || str_ends_with($duration, 'T')) throw new EwsCalendarSafetyException('Unsupported calendar duration');
+        $days = (int)($m[1] ?? 0) * 7 + (int)($m[2] ?? 0);
+        $seconds = (int)($m[3] ?? 0) * 3600 + (int)($m[4] ?? 0) * 60 + (int)($m[5] ?? 0);
+        if (($days === 0 && $seconds === 0) || $days * 86400 + $seconds > 366 * 86400) throw new EwsCalendarSafetyException('Unsupported calendar duration');
+        if ($allDay && (substr($start, 11) !== '00:00:00' || $days === 0 || $seconds !== 0)) throw new EwsCalendarSafetyException('Unsupported all-day interval');
+        $endWall = $wall + $days * 86400;
+        if (gmdate('Y', $endWall) > '9999') throw new EwsCalendarSafetyException('Calendar end out of range');
+        $endTs = self::calendarWallToUtc($endWall, $zone) + $seconds;
+        if ($endTs <= $startTs || gmdate('Y', $endTs) > '9999') throw new EwsCalendarSafetyException('Invalid calendar interval');
+        return [$startTs, $endTs, $zones[$name], $allDay];
+    }
+
+    /** RFC 8984: use the offset before a gap or overlap. */
+    private static function calendarWallToUtc(int $wall, DateTimeZone $zone): int {
+        $transitions = $zone->getTransitions($wall - 3 * 86400, $wall + 3 * 86400);
+        if (!$transitions) throw new EwsCalendarSafetyException('Unsupported time zone rules');
+        $previous = $transitions[0]['offset'];
+        foreach (array_slice($transitions, 1) as $transition) {
+            $next = $transition['offset'];
+            $a = $transition['ts'] + $previous;
+            $b = $transition['ts'] + $next;
+            if ($wall >= min($a, $b) && $wall < max($a, $b)) return $wall - $previous;
+            $previous = $next;
+        }
+        foreach ($transitions as $transition) {
+            $candidate = $wall - $transition['offset'];
+            if ($zone->getOffset((new DateTimeImmutable('@' . $candidate))) === $transition['offset']) return $candidate;
+        }
+        throw new EwsCalendarSafetyException('Cannot resolve calendar time zone');
+    }
+
+    private static function calendarRecurrenceXml(array $event, int $startTs, int $endTs, bool $allDay): string {
+        $rule = $event['recurrenceRule'] ?? null;
+        if ($rule === null) return '';
+        if ($rule instanceof stdClass) $rule = get_object_vars($rule);
+        if (!is_array($rule) || array_is_list($rule)) throw new EwsCalendarSafetyException('Invalid recurrence rule');
+        foreach ($rule as $key => $_) if (!in_array($key, ['@type', 'frequency', 'interval', 'byDay', 'firstDayOfWeek', 'count', 'until'], true)) throw new EwsCalendarSafetyException('Unsupported recurrence rule property: ' . $key);
+        if (array_key_exists('@type', $rule) && $rule['@type'] !== 'RecurrenceRule') throw new EwsCalendarSafetyException('Invalid recurrence rule type');
+        $interval = array_key_exists('interval', $rule) ? $rule['interval'] : 1;
+        if (!is_int($interval) || $interval < 1 || $interval > 99) throw new EwsCalendarSafetyException('Invalid recurrence interval');
+        $start = $event['start'];
+        $date = substr($start, 0, 10);
+        $days = ['mo' => 'Monday', 'tu' => 'Tuesday', 'we' => 'Wednesday', 'th' => 'Thursday', 'fr' => 'Friday', 'sa' => 'Saturday', 'su' => 'Sunday'];
+        $weekStart = array_key_exists('firstDayOfWeek', $rule) ? $rule['firstDayOfWeek'] : 'mo';
+        if (!is_string($weekStart) || !isset($days[$weekStart])) throw new EwsCalendarSafetyException('Invalid first day of week');
+        if (($event['timeZone'] ?? '') === 'Europe/Amsterdam' && !$allDay) {
+            $startClock = substr($start, 11);
+            $endLocal = (new DateTimeImmutable('@' . $endTs))->setTimezone(new DateTimeZone('Europe/Amsterdam'));
+            // Avoid series whose elapsed duration or local time can change on DST transition days.
+            if ($startClock < '03:00:00' || $endLocal->format('Y-m-d') !== $date || $endLocal->format('H:i:s') <= $startClock || preg_match('/^P(?:\d+W|\d+D)/', $event['duration'])) throw new EwsCalendarSafetyException('Recurring interval can cross a time zone transition');
+        }
+        switch ($rule['frequency'] ?? null) {
+            case 'daily':
+                if (array_key_exists('byDay', $rule)) throw new EwsCalendarSafetyException('Unsupported daily byDay');
+                $pattern = '<t:DailyRecurrence><t:Interval>' . $interval . '</t:Interval></t:DailyRecurrence>';
+                break;
+            case 'weekly':
+                $byDay = array_key_exists('byDay', $rule) ? $rule['byDay'] : [['day' => strtolower(substr(gmdate('D', self::utcTime($start, false)), 0, 2))]];
+                if (!is_array($byDay) || !array_is_list($byDay) || !$byDay) throw new EwsCalendarSafetyException('Invalid weekly byDay');
+                $selected = [];
+                foreach ($byDay as $day) {
+                    if ($day instanceof stdClass) $day = get_object_vars($day);
+                    if (!is_array($day) || array_diff(array_keys($day), ['@type', 'day']) || (array_key_exists('@type', $day) && $day['@type'] !== 'NDay') || !is_string($day['day'] ?? null) || !isset($days[$day['day']]) || isset($selected[$day['day']])) throw new EwsCalendarSafetyException('Unsupported weekly byDay');
+                    $selected[$day['day']] = $days[$day['day']];
+                }
+                $startDay = strtolower(substr(gmdate('D', self::utcTime($start, false)), 0, 2));
+                if (!isset($selected[$startDay])) throw new EwsCalendarSafetyException('Series start is not a weekly occurrence');
+                $pattern = '<t:WeeklyRecurrence><t:Interval>' . $interval . '</t:Interval><t:DaysOfWeek>' . implode(' ', $selected) . '</t:DaysOfWeek><t:FirstDayOfWeek>' . $days[$weekStart] . '</t:FirstDayOfWeek></t:WeeklyRecurrence>';
+                break;
+            default: throw new EwsCalendarSafetyException('Unsupported recurrence frequency');
+        }
+        if (array_key_exists('count', $rule) && array_key_exists('until', $rule)) throw new EwsCalendarSafetyException('Recurrence count and until cannot coexist');
+        if (array_key_exists('count', $rule)) {
+            if (!is_int($rule['count']) || $rule['count'] < 1 || $rule['count'] > 999) throw new EwsCalendarSafetyException('Invalid recurrence count');
+            $range = '<t:NumberedRecurrence><t:StartDate>' . $date . '</t:StartDate><t:NumberOfOccurrences>' . $rule['count'] . '</t:NumberOfOccurrences></t:NumberedRecurrence>';
+        } elseif (array_key_exists('until', $rule)) {
+            if (!is_string($rule['until'])) throw new EwsCalendarSafetyException('Invalid recurrence until');
+            $until = self::utcTime($rule['until'], false);
+            if ($until < self::utcTime($start, false)) throw new EwsCalendarSafetyException('Recurrence ends before start');
+            $endDate = substr($rule['until'], 0, 10);
+            if (substr($rule['until'], 11) < substr($start, 11)) $endDate = gmdate('Y-m-d', $until - 86400);
+            $range = '<t:EndDateRecurrence><t:StartDate>' . $date . '</t:StartDate><t:EndDate>' . $endDate . '</t:EndDate></t:EndDateRecurrence>';
+        } else {
+            $range = '<t:NoEndRecurrence><t:StartDate>' . $date . '</t:StartDate></t:NoEndRecurrence>';
+        }
+        return '<t:Recurrence>' . $pattern . $range . '</t:Recurrence>';
+    }
+
+    /** Only represent single, second-precision UTC events with exact elapsed durations. */
+    public static function safeCalendarTimes(array $event): array {
+        // JSCalendar 2.0 uses a single recurrenceRule object. Any non-null
+        // value, including a malformed empty object, is unsafe to represent.
+        if (array_key_exists('recurrenceRule', $event) && $event['recurrenceRule'] !== null) {
+            throw new EwsCalendarSafetyException('Recurring calendar events are not supported');
+        }
+        foreach (['recurrenceRules', 'recurrenceOverrides', 'excludedRecurrenceRules'] as $key) {
+            $value = $event[$key] ?? null;
+            if ($value !== null && $value !== [] && !($value instanceof stdClass && get_object_vars($value) === [])) {
+                throw new EwsCalendarSafetyException('Recurring calendar events are not supported');
+            }
+        }
+        foreach (['recurrenceId', 'recurrenceIdTimeZone', 'relatedTo'] as $key) {
+            if (!empty($event[$key])) throw new EwsCalendarSafetyException('Calendar occurrence or relationship is not supported');
+        }
+        if (($event['timeZone'] ?? null) !== 'UTC' ||
+            (isset($event['endTimeZone']) && $event['endTimeZone'] !== 'UTC') ||
+            !in_array($event['showWithoutTime'] ?? false, [false, null], true)) {
+            throw new EwsCalendarSafetyException('Only timed UTC calendar events are supported');
+        }
+        $start = $event['start'] ?? null;
+        if (!is_string($start)) throw new EwsCalendarSafetyException('Invalid calendar start');
+        $ts = self::utcTime($start, false);
+        $duration = $event['duration'] ?? null;
+        if (!is_string($duration) || !preg_match('/^P(?:(\d{1,3})D)?(?:T(?:(\d{1,3})H)?(?:(\d{1,3})M)?(?:(\d{1,3})S)?)?$/D', $duration, $m) || $duration === 'P' || str_ends_with($duration, 'T')) {
+            throw new EwsCalendarSafetyException('Unsupported calendar duration');
+        }
+        $seconds = (int)($m[1] ?? 0) * 86400 + (int)($m[2] ?? 0) * 3600 + (int)($m[3] ?? 0) * 60 + (int)($m[4] ?? 0);
+        if ($seconds <= 0 || $seconds > 366 * 86400 || gmdate('Y', $ts + $seconds) > '9999') throw new EwsCalendarSafetyException('Unsupported calendar duration');
+        return [$ts, $ts + $seconds];
+    }
+
+    public static function utcTime(string $value, bool $withZ): int {
+        $format = $withZ ? '!Y-m-d\TH:i:s\Z' : '!Y-m-d\TH:i:s';
+        $pattern = $withZ ? '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/D' : '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/D';
+        $date = preg_match($pattern, $value) ? DateTimeImmutable::createFromFormat($format, $value, new DateTimeZone('UTC')) : false;
+        if (!$date || $date->format($withZ ? 'Y-m-d\TH:i:s\Z' : 'Y-m-d\TH:i:s') !== $value || substr($value, 0, 4) === '0000') {
+            throw new EwsCalendarSafetyException('Only valid second-precision UTC times are supported');
+        }
+        return $date->getTimestamp();
+    }
+
+    public static function validateEwsEvent(DOMElement $event): void {
+        $seen = [];
+        foreach ($event->attributes as $attribute) {
+            if ($attribute->namespaceURI !== 'http://www.w3.org/2000/xmlns/') throw new EwsCalendarSafetyException('Unsupported calendar item attribute');
+        }
+        foreach ($event->childNodes as $child) {
+            if (!$child instanceof DOMElement) continue;
+            if ($child->namespaceURI !== EwsSoap::NS_T || !in_array($child->localName, ['Subject', 'Start', 'End', 'IsAllDayEvent', 'Location', 'Body'], true) || isset($seen[$child->localName])) {
+                throw new EwsCalendarSafetyException('Unsupported or duplicate calendar create field');
+            }
+            if ($child->firstElementChild || ($child->localName === 'Body' && $child->getAttribute('BodyType') !== 'Text')) throw new EwsCalendarSafetyException('Unsupported calendar field value');
+            foreach ($child->attributes as $attribute) {
+                if ($attribute->namespaceURI === 'http://www.w3.org/2000/xmlns/') continue;
+                if ($child->localName !== 'Body' || $attribute->namespaceURI || $attribute->localName !== 'BodyType') throw new EwsCalendarSafetyException('Unsupported calendar field attribute');
+            }
+            $seen[$child->localName] = trim($child->textContent);
+        }
+        if (isset($seen['IsAllDayEvent']) && !in_array($seen['IsAllDayEvent'], ['false', '0'], true)) throw new EwsCalendarSafetyException('All-day calendar events are not supported');
+        $start = self::utcTime($seen['Start'] ?? '', true);
+        $end = self::utcTime($seen['End'] ?? '', true);
+        if ($end <= $start || $end - $start > 366 * 86400) throw new EwsCalendarSafetyException('Invalid calendar interval');
     }
 
     private static function contactNameParts(array $name): array {
@@ -588,12 +828,13 @@ class EwsConverter {
     }
 
     public static function ewsEventToJmap(DOMElement $eventEl, string $calendarId): array {
+        self::validateEwsEvent($eventEl);
         $nsT = EwsSoap::NS_T;
 
         $startStr  = self::getXmlChildValue($eventEl, 't:Start');
         $endStr    = self::getXmlChildValue($eventEl, 't:End');
         $allDay    = strtolower(self::getXmlChildValue($eventEl, 't:IsAllDayEvent')) === 'true';
-        $subject   = self::getXmlChildValue($eventEl, 't:Subject') ?: '(No Subject)';
+        $subject   = self::getXmlChildValue($eventEl, 't:Subject');
         $location  = self::getXmlChildValue($eventEl, 't:Location');
         $body      = self::getXmlChildValue($eventEl, 't:Body');
 
@@ -606,6 +847,7 @@ class EwsConverter {
             'calendarIds' => [$calendarId => true],
             'title'       => $subject,
             'uid'         => bin2hex(random_bytes(16)) . '@ews-bridge',
+            'timeZone'    => 'UTC',
         ];
 
         if ($allDay) {
@@ -617,11 +859,11 @@ class EwsConverter {
             $event['duration'] = $duration > 0 ? JmapCalendarConverter::secondsToDuration($duration) : 'PT1H';
         }
 
-        if ($location) {
+        if ($location !== '') {
             $event['locations'] = ['l1' => ['@type' => 'Location', 'name' => $location]];
         }
 
-        if ($body) {
+        if ($body !== '') {
             $event['description'] = $body;
         }
 

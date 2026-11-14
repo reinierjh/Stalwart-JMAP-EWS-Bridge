@@ -37,7 +37,7 @@ try {
 $dom = new DOMDocument();
 $email = ['id' => 'm1', 'subject' => 'Subject', 'receivedAt' => '2025-01-01T00:00:00Z', 'keywords' => ['$seen' => true], 'blobId' => 'blob'];
 $card = ['id' => 'c1', 'name' => ['components' => [['kind' => 'given', 'value' => 'Jane']]], 'phones' => ['p1' => ['number' => '1']]];
-$event = ['id' => 'e1', 'start' => '2025-01-01T12:00:00', 'duration' => 'PT1H', 'title' => 'Title', 'participants' => ['p1' => ['name' => 'A']]];
+$event = ['id' => 'e1', 'start' => '2025-01-01T12:00:00', 'timeZone' => 'UTC', 'duration' => 'PT1H', 'title' => 'Title', 'organizerCalendarAddress' => 'mailto:a@example.org', 'participants' => ['p1' => ['name' => 'A', 'calendarAddress' => 'mailto:a@example.org', 'roles' => ['owner' => true]]]];
 foreach ([[$email, EwsConverter::emailToXml($dom, $email, 'folder')], [$card, EwsConverter::contactToXml($dom, $card, 'folder')], [$event, EwsConverter::calendarToXml($dom, $event, 'folder')]] as [$object, $xml]) {
     versionCheck(xmlChangeKey($xml) === EwsConverter::itemChangeKey($object), 'item XML uses shared version');
 }

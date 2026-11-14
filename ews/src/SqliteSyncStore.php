@@ -34,6 +34,10 @@ class SqliteSyncQuotaExceeded extends RuntimeException {}
  * snapshots, and bounded-depth delta chains retain immutable per-folder versions.
  * Every 32nd changed generation is a full reference checkpoint to cap traversal;
  * ancestor snapshots remain until no descendant or valid retry needs them.
+ * Seven days is a token TTL, not a data-deletion guarantee: delta ancestors may
+ * retain older versions longer, and WAL/backups may retain historical bytes.
+ * Schedule gcAll() periodically, including for inactive principals; protect and
+ * manage retention of the database, WAL, backups and filesystem accordingly.
  * The same item/ChangeKey with different canonical JSON is rejected while its
  * version is retained. Logical quotas count version payload once and references
  * per snapshot; they include
@@ -120,12 +124,12 @@ class SqliteSyncStore {
     private function initSchema(): void {
         $this->tx(function (): void {
             $version = (int)$this->db->query('PRAGMA user_version')->fetchColumn();
-            if ($version !== 0 && $version !== 3) throw new RuntimeException('Unsupported SQLite sync schema; a fresh store is required');
+            if ($version !== 0 && $version !== 4) throw new RuntimeException('Unsupported SQLite sync schema; a fresh store is required');
             if ($version === 0 && (int)$this->db->query("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")->fetchColumn() !== 0) throw new RuntimeException('SQLite sync database is not empty');
             $this->db->exec('CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY, principal TEXT NOT NULL, scope TEXT NOT NULL, charge INTEGER NOT NULL, parent_id INTEGER REFERENCES snapshots(id), depth INTEGER NOT NULL)');
             $this->db->exec('CREATE INDEX IF NOT EXISTS snapshots_principal ON snapshots(principal,scope)');
             $this->db->exec('CREATE INDEX IF NOT EXISTS snapshots_parent ON snapshots(parent_id)');
-            $this->db->exec('CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, principal TEXT NOT NULL, folder TEXT NOT NULL, scope TEXT NOT NULL, source TEXT, fingerprint TEXT NOT NULL, created INTEGER NOT NULL, change_count INTEGER NOT NULL, charge INTEGER NOT NULL, snapshot_id INTEGER NOT NULL REFERENCES snapshots(id))');
+            $this->db->exec('CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, principal TEXT NOT NULL, folder TEXT NOT NULL, scope TEXT NOT NULL, source TEXT, fingerprint TEXT NOT NULL, created INTEGER NOT NULL, change_count INTEGER NOT NULL, charge INTEGER NOT NULL, snapshot_id INTEGER NOT NULL REFERENCES snapshots(id), gc_pending INTEGER NOT NULL DEFAULT 0)');
             $this->db->exec('CREATE UNIQUE INDEX IF NOT EXISTS runs_source ON runs(scope,source,fingerprint) WHERE source IS NOT NULL');
             $this->db->exec('CREATE INDEX IF NOT EXISTS runs_initial ON runs(scope,fingerprint,created) WHERE source IS NULL');
             $this->db->exec('CREATE INDEX IF NOT EXISTS runs_principal ON runs(principal,folder)');
@@ -138,7 +142,7 @@ class SqliteSyncStore {
             $this->db->exec('CREATE TABLE IF NOT EXISTS changes (run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY(run_id,ordinal)) WITHOUT ROWID');
             $this->db->exec('CREATE TABLE IF NOT EXISTS tokens (hash TEXT PRIMARY KEY, token TEXT NOT NULL, run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE, offset INTEGER NOT NULL, expires INTEGER NOT NULL, UNIQUE(run_id,offset))');
             $this->db->exec('CREATE INDEX IF NOT EXISTS tokens_expiry ON tokens(expires)');
-            $this->db->exec('PRAGMA user_version=3');
+            $this->db->exec('PRAGMA user_version=4');
         });
     }
 
@@ -201,7 +205,7 @@ class SqliteSyncStore {
     }
 
     private function findToken(string $token, string $folder, int $now): array {
-        $row = $this->runQuery('SELECT t.hash,t.token,t.offset,t.expires,r.* FROM tokens t JOIN runs r ON r.id=t.run_id WHERE t.hash=? AND r.scope=? AND t.expires>?', [$this->tokenHash($token), $folder, $now])->fetch();
+        $row = $this->runQuery('SELECT t.hash,t.token,t.offset,t.expires,r.* FROM tokens t JOIN runs r ON r.id=t.run_id WHERE t.hash=? AND r.scope=? AND t.expires>? AND r.gc_pending=0', [$this->tokenHash($token), $folder, $now])->fetch();
         if (!$row) throw new SqliteSyncInvalidState('Unknown, expired or mismatched sync token');
         return $row;
     }
@@ -214,7 +218,12 @@ class SqliteSyncStore {
         // A live source may still retry a completed run even after its output tokens
         // have expired. Keep that run and its changes until the source expires.
         $orphan = ' NOT EXISTS (SELECT 1 FROM tokens t WHERE t.run_id=r.id) AND (r.source IS NULL OR NOT EXISTS (SELECT 1 FROM tokens s WHERE s.hash=r.source AND s.expires>?))';
-        $run = $this->runQuery('SELECT r.id FROM runs r WHERE' . $orphan . ' AND EXISTS (SELECT 1 FROM changes c WHERE c.run_id=r.id)' . $scope . ' LIMIT 1', $args)->fetch();
+        // Mark before removing any changes. The mark and the first deletion are
+        // committed together; no retry can resurrect a partially collected run.
+        $marked = $this->runQuery('UPDATE runs SET gc_pending=1 WHERE id IN (SELECT r.id FROM runs r WHERE' . $orphan . ' AND r.gc_pending=0 AND EXISTS (SELECT 1 FROM changes c WHERE c.run_id=r.id)' . $scope . ' LIMIT ' . $n . ')', $args)->rowCount();
+        $deleted += $marked;
+        if ($marked && $this->fault) ($this->fault)('gcAfterRunMarked');
+        $run = $this->runQuery('SELECT r.id FROM runs r WHERE' . $orphan . ' AND r.gc_pending=1 AND EXISTS (SELECT 1 FROM changes c WHERE c.run_id=r.id)' . $scope . ' LIMIT 1', $args)->fetch();
         if ($run) $deleted += $this->runQuery('DELETE FROM changes WHERE run_id=? AND ordinal IN (SELECT ordinal FROM changes WHERE run_id=? LIMIT ' . $n . ')', [(int)$run['id'], (int)$run['id']])->rowCount();
         $deleted += $this->runQuery('DELETE FROM runs WHERE id IN (SELECT r.id FROM runs r WHERE' . $orphan . ' AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.run_id=r.id)' . $scope . ' LIMIT ' . $n . ')', $args)->rowCount();
         $snapshotScope = $principal === null ? '' : ' AND s.principal=?';
@@ -271,7 +280,9 @@ class SqliteSyncStore {
 
     private function estimate(mixed $value, int &$budget, int $depth = 0): void {
         if ($depth > 128) throw new RuntimeException('Snapshot nesting limit exceeded');
-        if (is_array($value)) {
+        if ($value instanceof stdClass) {
+            $this->estimate(get_object_vars($value), $budget, $depth + 1);
+        } elseif (is_array($value)) {
             $budget -= 2;
             foreach ($value as $key => $v) {
                 $budget -= 4 + 6 * strlen((string)$key);
@@ -286,15 +297,55 @@ class SqliteSyncStore {
         if ($budget < 0) throw new RuntimeException('Snapshot object limit exceeded');
     }
 
-    private function canonicalObject(mixed $value, int $depth = 0): mixed {
+    /** Mirrors EwsConverter::canonicalJsonObject without loading the converter. */
+    private function canonicalObject(array $object, int $depth = 0): object {
+        if ($depth > 128) throw new RuntimeException('Snapshot nesting limit exceeded');
+        ksort($object, SORT_STRING);
+        foreach ($object as $key => $value) $object[$key] = $this->canonicalValue($value, $depth + 1);
+        return (object)$object;
+    }
+
+    private function canonicalValue(mixed $value, int $depth = 0): mixed {
         if ($depth > 128) throw new RuntimeException('Snapshot nesting limit exceeded');
         if (is_array($value)) {
-            if (!array_is_list($value)) ksort($value, SORT_STRING);
-            foreach ($value as $key => $v) $value[$key] = $this->canonicalObject($v, $depth + 1);
+            if (!array_is_list($value)) {
+                $keys = array_keys($value);
+                sort($keys, SORT_REGULAR);
+                if ($keys !== range(0, count($keys) - 1)) return $this->canonicalObject($value, $depth + 1);
+                ksort($value, SORT_NUMERIC);
+            }
+            foreach ($value as $key => $item) $value[$key] = $this->canonicalValue($item, $depth + 1);
             return $value;
         }
+        if ($value instanceof stdClass) return $this->canonicalObject(get_object_vars($value), $depth + 1);
         if (is_null($value) || is_bool($value) || is_int($value) || is_float($value) || is_string($value)) return $value;
         throw new InvalidArgumentException('Unsupported snapshot value');
+    }
+
+    /** Preserve numeric/empty JSON objects that associative decoding would turn into lists. */
+    private function decodeStoredValue(mixed $value, int $depth = 0): mixed {
+        if ($depth > 128) throw new RuntimeException('Snapshot nesting limit exceeded');
+        if ($value instanceof stdClass) {
+            $items = get_object_vars($value);
+            foreach ($items as $key => $item) $items[$key] = $this->decodeStoredValue($item, $depth + 1);
+            $keys = array_keys($items);
+            sort($keys, SORT_REGULAR);
+            // JSON objects with contiguous numeric keys must remain objects even
+            // if lexicographic property order (0,1,10,2,...) is not a PHP list.
+            return !$keys || $keys === range(0, count($keys) - 1) ? (object)$items : $items;
+        }
+        if (is_array($value)) {
+            foreach ($value as $key => $item) $value[$key] = $this->decodeStoredValue($item, $depth + 1);
+        }
+        return $value;
+    }
+
+    private function decodeStoredObject(string $json): array {
+        $object = json_decode($json, false, 512, JSON_THROW_ON_ERROR);
+        if (!$object instanceof stdClass) throw new RuntimeException('Corrupt sync object');
+        $items = get_object_vars($object);
+        foreach ($items as $key => $item) $items[$key] = $this->decodeStoredValue($item, 1);
+        return $items;
     }
 
     private function prepareData(array $records, array $changes): array {
@@ -307,8 +358,12 @@ class SqliteSyncStore {
                 !is_array($r['object'] ?? null) || ($r['object']['id'] ?? null) !== $r['id']) throw new InvalidArgumentException('Invalid snapshot item');
             $key = 'i' . base64_encode($r['id']);
             if (isset($ids[$key])) throw new InvalidArgumentException('Duplicate snapshot item');
-            $ids[$key] = true; $budget = $this->limits['objectBytes']; $this->estimate($r['object'], $budget);
-            $json = json_encode($this->canonicalObject($r['object']), JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+            $object = $r['object'];
+            // bodyValues is a fetch-dependent Email/get projection and is not
+            // part of EwsConverter::itemChangeKey. Nested names are not removed.
+            unset($object['bodyValues']);
+            $ids[$key] = true; $budget = $this->limits['objectBytes']; $this->estimate($object, $budget);
+            $json = json_encode($this->canonicalObject($object), JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
             $referenceCharge = 96 + strlen($r['id']);
             $snapshotCharge += $referenceCharge;
             $buildCharge += $referenceCharge + 192 + strlen($r['id']) + strlen($r['changeKey']) + strlen($json);
@@ -485,9 +540,9 @@ class SqliteSyncStore {
         if ($source !== null) {
             $prev = $this->findToken($source, $folder, $now);
             if ((int)$prev['offset'] !== (int)$prev['change_count']) throw new SqliteSyncInvalidState('Intermediate token is not a baseline');
-            $row = $this->runQuery('SELECT id FROM runs WHERE scope=? AND source=? AND fingerprint=?', [$folder, $prev['hash'], $fp])->fetch();
+            $row = $this->runQuery('SELECT id FROM runs WHERE scope=? AND source=? AND fingerprint=? AND gc_pending=0', [$folder, $prev['hash'], $fp])->fetch();
         } else {
-            $row = $this->runQuery('SELECT id FROM runs WHERE scope=? AND source IS NULL AND fingerprint=? AND created>=? ORDER BY created DESC,id DESC LIMIT 1', [$folder, $fp, $now - $this->limits['initialWindow']])->fetch();
+            $row = $this->runQuery('SELECT id FROM runs WHERE scope=? AND source IS NULL AND fingerprint=? AND created>? AND gc_pending=0 ORDER BY created DESC,id DESC LIMIT 1', [$folder, $fp, $now - $this->limits['initialWindow']])->fetch();
         }
         return $row ? (int)$row['id'] : null;
     }
@@ -535,7 +590,7 @@ class SqliteSyncStore {
                 if ($c['kind'] !== 'Delete') {
                     if ($c['member_id'] !== $c['item_id'] || $c['change_key'] === null || $c['object_json'] === null) throw new RuntimeException('Missing sync item');
                     $this->checkVersion($c, $folder);
-                    $object = json_decode($c['object_json'], true, 512, JSON_THROW_ON_ERROR);
+                    $object = $this->decodeStoredObject($c['object_json']);
                     if (!is_array($object) || ($object['id'] ?? null) !== $c['item_id']) throw new RuntimeException('Corrupt sync item');
                     $record = ['id' => $c['item_id'], 'changeKey' => $c['change_key'], 'object' => $object];
                 } elseif ($c['member_id'] !== null) throw new RuntimeException('Corrupt sync deletion');
@@ -566,7 +621,7 @@ class SqliteSyncStore {
             $items = [];
             foreach ($this->runQuery($this->materialCte() . 'SELECT i.item_id,v.item_id AS version_item,v.scope AS version_scope,v.change_key,v.object_json,v.content_hash FROM material i LEFT JOIN item_versions v ON v.id=i.version_id ORDER BY i.item_id', [(int)$row['snapshot_id']]) as $item) {
                 $this->checkVersion($item, $folder);
-                $object = json_decode($item['object_json'], true, 512, JSON_THROW_ON_ERROR);
+                $object = $this->decodeStoredObject($item['object_json']);
                 if (!is_array($object) || ($object['id'] ?? null) !== $item['item_id']) throw new RuntimeException('Corrupt sync item');
                 $items[] = ['id' => $item['item_id'], 'changeKey' => $item['change_key'], 'object' => $object];
                 if (count($items) === 1 && $this->fault) ($this->fault)('duringBaselineRead');

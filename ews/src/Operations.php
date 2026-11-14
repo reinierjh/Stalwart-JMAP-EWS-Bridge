@@ -1,6 +1,7 @@
 <?php
 
 require_once __DIR__ . '/SyncState.php';
+require_once __DIR__ . '/Converter.php';
 
 class EwsOperations {
 
@@ -238,6 +239,8 @@ class EwsOperations {
 
             return EwsSoap::buildSoapResponse($bodyXml);
 
+        } catch (EwsCalendarSafetyException $e) {
+            return $this->errorResponse('SyncFolderItems', 'ErrorInvalidOperation', $e->getMessage());
         } catch (EwsSyncException $e) {
             return $this->errorResponse('SyncFolderItems', $e->ewsCode, $e->getMessage());
         } catch (SqliteSyncInvalidState $e) {
@@ -267,6 +270,7 @@ class EwsOperations {
     private function syncItemXml(DOMDocument $dom, string $type, string $folder, string $id, mixed $record, string $shape): string {
         if (!is_array($record) || !is_array($record['object'] ?? null) || !is_string($record['changeKey'] ?? null) ||
             !hash_equals($record['changeKey'], EwsConverter::itemChangeKey($record['object']))) throw new RuntimeException('Stored item version mismatch');
+        if ($type === 'calendar') EwsConverter::safeCalendarTimes($record['object']);
         $tag = match ($type) { 'contacts' => 'Contact', 'calendar' => 'CalendarItem', default => 'Message' };
         if ($shape === 'IdOnly') return '<t:' . $tag . '>' . EwsSoap::buildId($dom, $id, $record['changeKey']) . '</t:' . $tag . '>';
         $xml = match ($type) {
@@ -396,6 +400,7 @@ class EwsOperations {
             $expected = array_fill_keys(array_map(fn($id) => 'i' . base64_encode($id), $chunk), true);
             foreach ($r['list'] as $object) {
                 if (!is_array($object) || !isset($object['id']) || !is_string($object['id'])) throw new RuntimeException('Invalid JMAP object');
+                if ($type === 'calendar') EwsConverter::safeCalendarTimes($object);
                 unset($object['bodyValues']);
                 $key = 'i' . base64_encode($object['id']);
                 if (!isset($expected[$key]) || isset($objects[$key])) throw new RuntimeException('Unexpected JMAP object');
@@ -556,6 +561,16 @@ class EwsOperations {
 
     public function findItem(DOMElement $request): string {
         try {
+            if ($request->getElementsByTagNameNS(EwsSoap::NS_M, 'CalendarView')->length || $request->getElementsByTagNameNS(EwsSoap::NS_T, 'CalendarView')->length) {
+                return $this->errorResponse('FindItem', 'ErrorInvalidOperation', 'CalendarView is not supported');
+            }
+            $parents = EwsSoap::getFirstChild($request, 'ParentFolderIds');
+            if ($parents) foreach ($parents->childNodes as $folder) {
+                if ($folder instanceof DOMElement && (($folder->localName === 'FolderId' && str_starts_with($folder->getAttribute('Id'), EwsConverter::PFX_CALENDAR)) ||
+                    ($folder->localName === 'DistinguishedFolderId' && strtolower($folder->getAttribute('Id')) === 'calendar'))) {
+                    return $this->errorResponse('FindItem', 'ErrorInvalidOperation', 'Calendar search is not supported');
+                }
+            }
             $itemShape = EwsSoap::getFirstChild($request, 'ItemShape');
             $baseShape = $itemShape ? EwsSoap::getChildValue($itemShape, 'BaseShape') : 'Default';
 
@@ -625,6 +640,7 @@ class EwsOperations {
 
     public function getItem(DOMElement $request): string {
         try {
+            $this->rejectOccurrenceIds($request);
             $itemShape = EwsSoap::getFirstChild($request, 'ItemShape');
             $wantMime = false;
             if ($itemShape) {
@@ -776,6 +792,8 @@ class EwsOperations {
 
             return EwsSoap::buildSoapResponse($bodyXml);
 
+        } catch (EwsCalendarSafetyException $e) {
+            return $this->errorResponse('GetItem', 'ErrorInvalidOperation', $e->getMessage());
         } catch (\Throwable $e) {
             return $this->errorResponse('GetItem', 'ErrorInternalServerError', $e->getMessage());
         }
@@ -783,13 +801,40 @@ class EwsOperations {
 
     public function createItem(DOMElement $request): string {
         try {
-            $savedFolderIdEl = EwsSoap::getFirstChild($request, 'SavedItemFolderId');
-            $parentFolderId = $this->resolveFolderIdFromEl($savedFolderIdEl);
-
             $itemsEl = EwsSoap::getFirstChild($request, 'Items');
             if (!$itemsEl) {
                 return $this->errorResponse('CreateItem', 'ErrorInvalidRequest', 'Missing Items element');
             }
+            $items = [];
+            foreach ($itemsEl->childNodes as $node) if ($node instanceof DOMElement) $items[] = $node;
+            $calendarItems = $request->getElementsByTagNameNS(EwsSoap::NS_T, 'CalendarItem');
+            if ($calendarItems->length || array_filter($items, fn($node) => $node->localName === 'CalendarItem')) {
+                if (count($items) !== 1 || $items[0]->namespaceURI !== EwsSoap::NS_T || $items[0]->localName !== 'CalendarItem' || $calendarItems->length !== 1) throw new EwsCalendarSafetyException('Mixed or multiple calendar creates are not supported');
+                $this->rejectCalendarContext($request);
+                foreach ($request->childNodes as $child) {
+                    if ($child instanceof DOMElement && ($child->namespaceURI !== EwsSoap::NS_M || !in_array($child->localName, ['Items', 'SavedItemFolderId'], true))) throw new EwsCalendarSafetyException('Unsupported calendar create option');
+                }
+                foreach ($request->attributes as $attribute) {
+                    if ($attribute->namespaceURI === 'http://www.w3.org/2000/xmlns/') continue;
+                    if ($attribute->namespaceURI || $attribute->localName !== 'SendMeetingInvitations' || $attribute->value !== 'SendToNone') throw new EwsCalendarSafetyException('Unsupported calendar create option');
+                }
+                $containers = 0; $folders = 0;
+                foreach ($request->childNodes as $child) if ($child instanceof DOMElement) {
+                    if ($child->localName === 'Items') $containers++;
+                    if ($child->localName === 'SavedItemFolderId') {
+                        $folders++;
+                        $ids = [];
+                        foreach ($child->childNodes as $folder) if ($folder instanceof DOMElement) $ids[] = $folder;
+                        if (count($ids) !== 1 || $ids[0]->namespaceURI !== EwsSoap::NS_T ||
+                            !(($ids[0]->localName === 'FolderId' && str_starts_with($ids[0]->getAttribute('Id'), EwsConverter::PFX_CALENDAR) && strlen($ids[0]->getAttribute('Id')) > strlen(EwsConverter::PFX_CALENDAR)) ||
+                              ($ids[0]->localName === 'DistinguishedFolderId' && $ids[0]->getAttribute('Id') === 'calendar')) || $ids[0]->firstElementChild) throw new EwsCalendarSafetyException('Invalid calendar folder');
+                    }
+                }
+                if ($containers !== 1 || $folders > 1) throw new EwsCalendarSafetyException('Invalid calendar create request');
+                EwsConverter::validateEwsEvent($items[0]);
+            }
+            $savedFolderIdEl = EwsSoap::getFirstChild($request, 'SavedItemFolderId');
+            $parentFolderId = $this->resolveFolderIdFromEl($savedFolderIdEl);
 
             $dom = new DOMDocument();
             $itemsXml = '';
@@ -855,20 +900,15 @@ class EwsOperations {
                             : $this->getDefaultCalendarId(true);
                         if ($calId === null || $calId === '') throw new RuntimeException('No calendar available');
                         $event = EwsConverter::ewsEventToJmap($itemNode, $calId);
-                        try {
-                            $r = $this->client->call([
+                        $r = $this->client->call([
                                 ['CalendarEvent/set', [
                                     'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                                     'create'    => ['ev1' => $event],
                                 ], '0'],
                             ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
-                            $created = $r[0][1]['created']['ev1'] ?? null;
-                            if ($created) {
-                                $itemsXml .= EwsSoap::buildId($dom, $created['id']);
-                            }
-                        } catch (\Throwable $e2) {
-                            $itemsXml .= EwsSoap::buildId($dom, 'error-' . uniqid());
-                        }
+                        $created = $r[0][1]['created']['ev1'] ?? null;
+                        if (($r[0][0] ?? null) !== 'CalendarEvent/set' || !is_string($created['id'] ?? null) || $created['id'] === '') throw new RuntimeException('Calendar create failed');
+                        $itemsXml .= EwsSoap::buildId($dom, EwsConverter::PFX_CALENDAR . $created['id']);
                         break;
                 }
             }
@@ -888,6 +928,8 @@ class EwsOperations {
 
             return EwsSoap::buildSoapResponse($bodyXml);
 
+        } catch (EwsCalendarSafetyException $e) {
+            return $this->errorResponse('CreateItem', 'ErrorInvalidOperation', $e->getMessage());
         } catch (\Throwable $e) {
             return $this->errorResponse('CreateItem', 'ErrorInternalServerError', $e->getMessage());
         }
@@ -898,6 +940,35 @@ class EwsOperations {
             $itemChanges = EwsSoap::getFirstChild($request, 'ItemChanges');
             if (!$itemChanges) {
                 return $this->errorResponse('UpdateItem', 'ErrorInvalidRequest', 'Missing ItemChanges');
+            }
+
+            $this->rejectOccurrenceIds($request);
+            $allChanges = $itemChanges->getElementsByTagNameNS(EwsSoap::NS_T, 'ItemChange');
+            $hasCalendar = false;
+            foreach ($allChanges as $change) {
+                $itemId = EwsSoap::getFirstChild($change, 'ItemId', EwsSoap::NS_T);
+                if ($itemId && str_starts_with($itemId->getAttribute('Id'), EwsConverter::PFX_CALENDAR)) $hasCalendar = true;
+            }
+            if ($hasCalendar) {
+                if ($allChanges->length !== 1) throw new EwsCalendarSafetyException('Mixed or multiple calendar updates are not supported');
+                $this->rejectCalendarContext($request);
+                $requestChildren = [];
+                foreach ($request->childNodes as $child) if ($child instanceof DOMElement) $requestChildren[] = $child;
+                if (count($requestChildren) !== 1 || $requestChildren[0] !== $itemChanges || $itemChanges->namespaceURI !== EwsSoap::NS_M) throw new EwsCalendarSafetyException('Unsupported calendar update option');
+                foreach ($request->attributes as $attribute) {
+                    if ($attribute->namespaceURI === 'http://www.w3.org/2000/xmlns/') continue;
+                    if ($attribute->namespaceURI || $attribute->localName !== 'SendMeetingInvitationsOrCancellations' || $attribute->value !== 'SendToNone') throw new EwsCalendarSafetyException('Unsupported calendar update option');
+                }
+                $changeChildren = [];
+                foreach ($allChanges->item(0)->childNodes as $child) if ($child instanceof DOMElement) $changeChildren[] = $child;
+                $directChanges = [];
+                foreach ($itemChanges->childNodes as $child) if ($child instanceof DOMElement) $directChanges[] = $child;
+                if (count($directChanges) !== 1 || $directChanges[0] !== $allChanges->item(0) || count($changeChildren) !== 2 ||
+                    $changeChildren[0]->namespaceURI !== EwsSoap::NS_T || $changeChildren[0]->localName !== 'ItemId' ||
+                    $changeChildren[1]->namespaceURI !== EwsSoap::NS_T || $changeChildren[1]->localName !== 'Updates') throw new EwsCalendarSafetyException('Invalid calendar update request');
+                $updates = EwsSoap::getFirstChild($allChanges->item(0), 'Updates', EwsSoap::NS_T);
+                if (!$updates) throw new EwsCalendarSafetyException('Missing calendar updates');
+                $this->calendarUpdatePatch($updates);
             }
 
             $dom = new DOMDocument();
@@ -920,9 +991,9 @@ class EwsOperations {
                 }
 
                 if (str_starts_with($id, EwsConverter::PFX_CONTACTS)) {
-                    $response = $this->updateContact($id, $updates);
+                    $response = $this->updateContact($id, $updates, $changeKey);
                 } elseif (str_starts_with($id, EwsConverter::PFX_CALENDAR)) {
-                    $response = $this->updateCalendarEvent($id, $updates);
+                    $response = $this->updateCalendarEvent($id, $updates, $changeKey);
                 } else {
                     $response = $this->updateEmail($id, $updates);
                 }
@@ -936,6 +1007,8 @@ class EwsOperations {
 
             return EwsSoap::buildSoapResponse($bodyXml);
 
+        } catch (EwsCalendarSafetyException $e) {
+            return $this->errorResponse('UpdateItem', 'ErrorInvalidPropertySet', $e->getMessage());
         } catch (\Throwable $e) {
             return $this->errorResponse('UpdateItem', 'ErrorInternalServerError', $e->getMessage());
         }
@@ -943,6 +1016,7 @@ class EwsOperations {
 
     public function deleteItem(DOMElement $request): string {
         try {
+            $this->rejectOccurrenceIds($request);
             $deleteType = EwsSoap::getChildValue($request, 'DeleteType');
             $isHardDelete = strtolower($deleteType) === 'harddelete';
 
@@ -956,6 +1030,7 @@ class EwsOperations {
             for ($i = 0; $i < $idEls->length; $i++) {
                 $ids[] = $idEls->item($i)->getAttribute('Id');
             }
+            foreach ($ids as $id) if (str_starts_with($id, EwsConverter::PFX_CALENDAR)) throw new EwsCalendarSafetyException('Calendar deletion is not supported');
 
             $dom = new DOMDocument();
             $responsesXml = '';
@@ -1045,6 +1120,8 @@ class EwsOperations {
 
             return EwsSoap::buildSoapResponse($bodyXml);
 
+        } catch (EwsCalendarSafetyException $e) {
+            return $this->errorResponse('DeleteItem', 'ErrorInvalidOperation', $e->getMessage());
         } catch (\Throwable $e) {
             return $this->errorResponse('DeleteItem', 'ErrorInternalServerError', $e->getMessage());
         }
@@ -1314,76 +1391,14 @@ class EwsOperations {
     }
 
     public function getUserAvailability(DOMElement $request): string {
-        try {
-            $timeWindow = EwsSoap::getFirstChild($request, 'FreeBusyViewOptions')
-                ?->getElementsByTagNameNS(EwsSoap::NS_T, 'TimeWindow')->item(0);
-
-            $startTime = $timeWindow ? EwsSoap::getChildValue($timeWindow, 'StartTime', '', '') : gmdate('Y-m-d\TH:i:s\Z');
-            $endTime   = $timeWindow ? EwsSoap::getChildValue($timeWindow, 'EndTime', '', '')   : gmdate('Y-m-d\TH:i:s\Z', strtotime('+1 day'));
-
-            $r = $this->client->call([
-                ['CalendarEvent/query', [
-                    'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
-                    'filter'    => [
-                        'after'  => gmdate('Y-m-d\TH:i:s\Z', strtotime($startTime)),
-                        'before' => gmdate('Y-m-d\TH:i:s\Z', strtotime($endTime)),
-                    ],
-                    'limit'     => 500,
-                ], 'q'],
-                ['CalendarEvent/get', [
-                    'accountId'  => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
-                    '#ids'       => ['resultOf' => 'q', 'name' => 'CalendarEvent/query', 'path' => '/ids'],
-                    'properties' => ['id', 'title', 'start', 'duration', 'freeBusyStatus', 'showWithoutTime'],
-                ], 'g'],
-            ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
-
-            $events = $r[1][1]['list'] ?? [];
-            $calEventsXml = '';
-
-            foreach ($events as $event) {
-                $status = match($event['freeBusyStatus'] ?? 'busy') {
-                    'free'        => 'Free',
-                    'tentative'   => 'Tentative',
-                    'unavailable' => 'OOF',
-                    default       => 'Busy',
-                };
-
-                $startTs  = JmapCalendarConverter::jmapTimeToTimestamp($event['start'] ?? '');
-                $durSecs  = JmapCalendarConverter::parseDuration($event['duration'] ?? 'PT1H');
-                $endTs    = $startTs + $durSecs;
-
-                $calEventsXml .= '<t:CalendarEvent>' .
-                    '<t:StartTime>' . gmdate('Y-m-d\TH:i:s\Z', $startTs) . '</t:StartTime>' .
-                    '<t:EndTime>' . gmdate('Y-m-d\TH:i:s\Z', $endTs) . '</t:EndTime>' .
-                    '<t:BusyType>' . $status . '</t:BusyType>' .
-                    '</t:CalendarEvent>';
-            }
-
-            $bodyXml = '<m:GetUserAvailabilityResponse>' .
-                '<m:FreeBusyResponseArray>' .
-                '<m:FreeBusyResponse>' .
-                '<m:ResponseMessage ResponseClass="Success">' .
-                '<m:ResponseCode>NoError</m:ResponseCode>' .
-                '</m:ResponseMessage>' .
-                '<m:FreeBusyView>' .
-                '<t:FreeBusyViewType>Detailed</t:FreeBusyViewType>' .
-                '<t:CalendarEventArray>' . $calEventsXml . '</t:CalendarEventArray>' .
-                '<t:WorkingHours>' .
-                '<t:TimeZone>UTC</t:TimeZone>' .
-                '<t:WorkDays>MondayTuesdayWednesdayThursdayFriday</t:WorkDays>' .
-                '<t:StartTimeInMinutes>480</t:StartTimeInMinutes>' .
-                '<t:EndTimeInMinutes>1020</t:EndTimeInMinutes>' .
-                '</t:WorkingHours>' .
-                '</m:FreeBusyView>' .
-                '</m:FreeBusyResponse>' .
-                '</m:FreeBusyResponseArray>' .
-                '</m:GetUserAvailabilityResponse>';
-
-            return EwsSoap::buildSoapResponse($bodyXml);
-
-        } catch (\Throwable $e) {
-            return $this->errorResponse('GetUserAvailability', 'ErrorInternalServerError', $e->getMessage());
-        }
+        // Availability cannot be inferred safely without recurrence expansion,
+        // mailbox identity, complete results and time-zone interpretation.
+        $count = max(1, $request->getElementsByTagNameNS(EwsSoap::NS_T, 'MailboxData')->length);
+        $response = '<m:FreeBusyResponse><m:ResponseMessage ResponseClass="Error">' .
+            '<m:MessageText>Availability is not supported</m:MessageText>' .
+            '<m:ResponseCode>ErrorInvalidOperation</m:ResponseCode></m:ResponseMessage></m:FreeBusyResponse>';
+        return EwsSoap::buildSoapResponse('<m:GetUserAvailabilityResponse><m:FreeBusyResponseArray>' .
+            str_repeat($response, $count) . '</m:FreeBusyResponseArray></m:GetUserAvailabilityResponse>');
     }
 
     public function convertId(DOMElement $request): string {
@@ -1764,10 +1779,12 @@ class EwsOperations {
         }
     }
 
-    private function updateContact(string $id, DOMElement $updates): string {
+    private function updateContact(string $id, DOMElement $updates, string $changeKey): string {
         $jmapId = $this->jmapId($id);
         $patch = [];
         $nameChanges = [];
+        $indexedChanges = [];
+        $legacyChanges = [];
         $nameFields = [
             'contacts:GivenName' => 'given', 'contacts:Surname' => 'surname',
             'contacts:MiddleName' => 'additional', 'contacts:Title' => 'prefix',
@@ -1776,9 +1793,20 @@ class EwsOperations {
 
         foreach ($updates->childNodes as $field) {
             if (!$field instanceof DOMElement) continue;
-            if ($field->namespaceURI !== EwsSoap::NS_T || $field->localName !== 'SetItemField') {
+            if ($field->namespaceURI !== EwsSoap::NS_T || !in_array($field->localName, ['SetItemField', 'DeleteItemField'], true)) {
                 return $this->contactUpdateError('ErrorInvalidPropertySet', 'Unsupported contact update operation');
             }
+            $elements = [];
+            foreach ($field->childNodes as $child) if ($child instanceof DOMElement) $elements[] = $child;
+            if (isset($elements[0]) && $elements[0]->namespaceURI === EwsSoap::NS_T && $elements[0]->localName === 'IndexedFieldURI') {
+                try {
+                    $indexedChanges[] = $this->parseContactIndexedUpdate($field, $elements);
+                } catch (DomainException $e) {
+                    return $this->contactUpdateError('ErrorInvalidPropertySet', $e->getMessage());
+                }
+                continue;
+            }
+            if ($field->localName !== 'SetItemField') return $this->contactUpdateError('ErrorInvalidPropertySet', 'Unsupported contact update operation');
             $path = null; $valueEl = null;
             foreach ($field->childNodes as $child) {
                 if (!$child instanceof DOMElement) continue;
@@ -1804,36 +1832,48 @@ class EwsOperations {
             }
             switch ($fieldUri) {
                 case 'contacts:CompanyName':
-                    $patch['organizations'] = ['o1' => ['name' => trim($valueEl->textContent)]];
-                    break;
                 case 'contacts:JobTitle':
-                    $patch['jobTitles'] = ['jt1' => ['name' => trim($valueEl->textContent)]];
-                    break;
                 case 'contacts:Department':
-                    $patch['departments'] = ['d1' => ['name' => trim($valueEl->textContent)]];
+                case 'contacts:BusinessHomePage':
+                    $map = match ($fieldUri) { 'contacts:CompanyName' => 'organizations', 'contacts:JobTitle' => 'jobTitles', 'contacts:Department' => 'departments', default => 'links' };
+                    if (isset($legacyChanges[$map])) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Duplicate contact update');
+                    $valueNode = $valueEl;
+                    if ($valueEl->childElementCount) {
+                        if ($valueEl->localName !== 'Contact' || $valueEl->childElementCount !== 1) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Invalid contact value');
+                        $valueNode = $valueEl->firstElementChild;
+                        if ($valueNode->namespaceURI !== EwsSoap::NS_T || $valueNode->localName !== substr($fieldUri, strlen('contacts:')) || $valueNode->childElementCount) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Invalid contact value');
+                        foreach ($valueEl->childNodes as $node) if (($node instanceof DOMText || $node instanceof DOMCdataSection) && trim($node->textContent) !== '') return $this->contactUpdateError('ErrorInvalidPropertySet', 'Invalid contact value');
+                    }
+                    $value = trim($valueNode->textContent);
+                    if ($value === '') return $this->contactUpdateError('ErrorInvalidPropertySet', 'Empty contact value');
+                    $legacyChanges[$map] = $value;
                     break;
                 case 'contacts:Email1Address':
                 case 'contacts:Email1':
-                    $patch['emails'] = ($patch['emails'] ?? []) + ['e1' => ['address' => trim($valueEl->textContent), 'contexts' => ['work' => true]]];
-                    break;
                 case 'contacts:Email2Address':
                 case 'contacts:Email2':
-                    $patch['emails'] = ($patch['emails'] ?? []) + ['e2' => ['address' => trim($valueEl->textContent), 'contexts' => ['home' => true]]];
-                    break;
                 case 'contacts:BusinessPhone':
-                    $patch['phones'] = ($patch['phones'] ?? []) + ['p1' => ['number' => trim($valueEl->textContent), 'contexts' => ['work' => true]]];
-                    break;
                 case 'contacts:HomePhone':
-                    $patch['phones'] = ($patch['phones'] ?? []) + ['p2' => ['number' => trim($valueEl->textContent), 'contexts' => ['home' => true]]];
-                    break;
                 case 'contacts:MobilePhone':
-                    $patch['phones'] = ($patch['phones'] ?? []) + ['p3' => ['number' => trim($valueEl->textContent), 'features' => ['cell' => true]]];
-                    break;
                 case 'contacts:IMAddress':
-                    $patch['onlineServices'] = ['im1' => ['uri' => trim($valueEl->textContent)]];
-                    break;
-                case 'contacts:BusinessHomePage':
-                    $patch['links'] = ['l1' => ['@type' => 'Link', 'uri' => trim($valueEl->textContent)]];
+                    $valueNode = $valueEl;
+                    if ($valueEl->childElementCount) {
+                        if ($valueEl->localName !== 'Contact' || $valueEl->childElementCount !== 1) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Invalid contact value');
+                        $valueNode = $valueEl->firstElementChild;
+                        if ($valueNode->namespaceURI !== EwsSoap::NS_T || $valueNode->localName !== substr($fieldUri, strlen('contacts:')) || $valueNode->childElementCount) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Invalid contact value');
+                        foreach ($valueEl->childNodes as $node) if (($node instanceof DOMText || $node instanceof DOMCdataSection) && trim($node->textContent) !== '') return $this->contactUpdateError('ErrorInvalidPropertySet', 'Invalid contact value');
+                    }
+                    $value = trim($valueNode->textContent);
+                    if ($value === '') return $this->contactUpdateError('ErrorInvalidPropertySet', 'Empty contact value');
+                    if (str_starts_with($fieldUri, 'contacts:Email')) {
+                        $map = 'emails'; $index = str_contains($fieldUri, 'Email1') ? 'EmailAddress1' : 'EmailAddress2';
+                    } elseif ($fieldUri === 'contacts:IMAddress') {
+                        if (!preg_match('/^(?:im|xmpp|sip|sips|matrix):/i', $value)) return $this->contactUpdateError('ErrorInvalidPropertySet', 'IM address must have a supported URI scheme');
+                        $map = 'onlineServices'; $index = 'ImAddress1';
+                    } else {
+                        $map = 'phones'; $index = substr($fieldUri, strlen('contacts:'));
+                    }
+                    $indexedChanges[] = ['map' => $map, 'index' => $index, 'part' => null, 'delete' => false, 'value' => $value];
                     break;
                 case 'contacts:BusinessStreet':
                 case 'contacts:BusinessCity':
@@ -1845,13 +1885,21 @@ class EwsOperations {
             }
         }
 
-        if (empty($patch) && empty($nameChanges)) {
+        if (empty($patch) && empty($nameChanges) && empty($indexedChanges) && empty($legacyChanges)) {
             return $this->contactUpdateError('ErrorInvalidPropertySet', 'No supported contact updates');
+        }
+
+        $seenIndexed = [];
+        foreach ($indexedChanges as $change) {
+            if (array_key_exists($change['map'], $patch)) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Conflicting contact updates');
+            $identity = $change['map'] . '/' . $change['index'] . '/' . ($change['part'] ?? '');
+            if (isset($seenIndexed[$identity])) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Duplicate indexed update');
+            $seenIndexed[$identity] = true;
         }
 
         try {
             $state = null;
-            if ($nameChanges) {
+            {
                 $get = $this->client->call([
                     ['ContactCard/get', ['accountId' => $this->contactsAccountId, 'ids' => [$jmapId], 'properties' => null], '0'],
                 ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
@@ -1869,8 +1917,10 @@ class EwsOperations {
                     return $this->contactUpdateError('ErrorInternalServerError', 'Unexpected contact read result');
                 }
                 $state = $result['state'];
-                $name = $this->mergeContactName($result['list'][0], $nameChanges);
-                $patch['name'] = $name;
+                if ($changeKey !== '' && !hash_equals(EwsConverter::itemChangeKey($result['list'][0]), $changeKey)) return $this->contactUpdateError('ErrorIrresolvableConflict', 'Contact item changed');
+                if ($nameChanges) $patch['name'] = $this->mergeContactName($result['list'][0], $nameChanges);
+                if ($indexedChanges) $patch += $this->mergeContactIndexed($result['list'][0], $indexedChanges, $changeKey !== '');
+                if ($legacyChanges) $patch += $this->mergeContactLegacyMaps($result['list'][0], $legacyChanges);
             }
             $arguments = ['accountId' => $this->contactsAccountId, 'update' => [$jmapId => $patch]];
             if ($state !== null) $arguments['ifInState'] = $state;
@@ -1885,18 +1935,33 @@ class EwsOperations {
             if (($r[0][0] ?? '') !== 'ContactCard/set' || !is_array($r[0][1] ?? null)) {
                 return $this->contactUpdateError('ErrorInternalServerError', 'Unexpected contact update result');
             }
-            $success = is_array($r[0][1]['updated'] ?? null) && array_key_exists($jmapId, $r[0][1]['updated']);
+            $notUpdated = $r[0][1]['notUpdated'] ?? null;
+            $success = is_array($r[0][1]['updated'] ?? null) && array_key_exists($jmapId, $r[0][1]['updated']) && !(is_array($notUpdated) && array_key_exists($jmapId, $notUpdated));
             if (!$success) {
                 $type = $r[0][1]['notUpdated'][$jmapId]['type'] ?? '';
                 return $this->contactUpdateError($type === 'notFound' ? 'ErrorItemNotFound' : ($type === 'stateMismatch' ? 'ErrorIrresolvableConflict' : 'ErrorInternalServerError'), 'Contact update failed: ' . $type);
             }
+            $newState = $r[0][1]['newState'] ?? null;
+            if (!is_string($newState) || $newState === '') return $this->contactUpdateError('ErrorInternalServerError', 'Contact updated, but new state is unavailable');
+            try {
+                $after = $this->client->call([
+                    ['ContactCard/get', ['accountId' => $this->contactsAccountId, 'ids' => [$jmapId], 'properties' => null], '0'],
+                ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
+            } catch (\Throwable $e) {
+                return $this->contactUpdateError('ErrorInternalServerError', 'Contact updated, but its resulting version cannot be read');
+            }
+            $afterData = $after[0][1] ?? null;
+            if (($after[0][0] ?? '') !== 'ContactCard/get' || !is_array($afterData) || ($afterData['state'] ?? null) !== $newState || !is_array($afterData['list'] ?? null) || count($afterData['list']) !== 1 || ($afterData['list'][0]['id'] ?? null) !== $jmapId) {
+                return $this->contactUpdateError('ErrorIrresolvableConflict', 'Contact updated, but its resulting version cannot be determined');
+            }
+            $updatedKey = EwsConverter::itemChangeKey($afterData['list'][0]);
             return '<m:ItemResponseMessage ResponseClass="' . ($success ? 'Success' : 'Error') . '">' .
                 '<m:MessageText></m:MessageText>' .
                 '<m:ResponseCode>' . ($success ? 'NoError' : 'ErrorItemNotFound') . '</m:ResponseCode>' .
-                EwsSoap::buildId(new DOMDocument(), $id, $jmapId) .
+                EwsSoap::buildId(new DOMDocument(), $id, $updatedKey) .
                 '</m:ItemResponseMessage>';
         } catch (DomainException $e) {
-            return $this->contactUpdateError('ErrorInvalidPropertySet', $e->getMessage());
+            return $this->contactUpdateError($e->getCode() === 1 ? 'ErrorChangeKeyRequired' : 'ErrorInvalidPropertySet', $e->getMessage());
         } catch (\Throwable $e) {
             return '<m:ItemResponseMessage ResponseClass="Error">' .
                 '<m:MessageText>' . EwsSoap::escapeXml($e->getMessage()) . '</m:MessageText>' .
@@ -1908,6 +1973,258 @@ class EwsOperations {
     private function contactUpdateError(string $code, string $message): string {
         return '<m:ItemResponseMessage ResponseClass="Error"><m:MessageText>' . EwsSoap::escapeXml($message) .
             '</m:MessageText><m:ResponseCode>' . EwsSoap::escapeXml($code) . '</m:ResponseCode></m:ItemResponseMessage>';
+    }
+
+    private function mergeContactLegacyMaps(array $card, array $changes): array {
+        $patch = [];
+        if (isset($card['localizations']) && !is_array($card['localizations'])) throw new DomainException('Unsupported contact localizations');
+        foreach ($changes as $map => $value) {
+            foreach (($card['localizations'] ?? []) as $localization) {
+                if (!is_array($localization)) throw new DomainException('Unsupported contact localizations');
+                foreach ($localization as $path => $_) if ($path === $map || str_starts_with((string)$path, $map . '/')) throw new DomainException('Localized contact data cannot be safely updated');
+            }
+            $entries = $card[$map] ?? [];
+            if (!is_array($entries) || count($entries) > 1) throw new DomainException('Ambiguous contact ' . $map);
+            if ($map === 'jobTitles' && !$entries && !empty($card['titles'])) throw new DomainException('Legacy titles cannot be safely updated');
+            $property = $map === 'links' ? 'uri' : 'name';
+            if (!$entries) {
+                $entry = [$property => $value];
+                if ($map === 'links') $entry += ['@type' => 'Link', 'contexts' => ['work' => true]];
+                if (!isset($card[$map])) $patch[$map] = (object)['ews1' => $entry];
+                else $patch[$map . '/ews1'] = $entry;
+            } else {
+                $key = array_key_first($entries); $entry = $entries[$key];
+                if (!is_array($entry) || ($map === 'links' && ($entry['contexts']['work'] ?? false) !== true)) throw new DomainException('Ambiguous contact ' . $map);
+                $path = $map . '/' . str_replace(['~', '/'], ['~0', '~1'], (string)$key) . '/' . $property;
+                $patch[$path] = $value;
+            }
+        }
+        return $patch;
+    }
+
+    private function parseContactIndexedUpdate(DOMElement $field, array $children): array {
+        $path = $children[0];
+        $this->validateContactIndexedXml($field, []);
+        $this->validateContactIndexedXml($path, ['FieldURI', 'FieldIndex']);
+        $uri = $path->getAttribute('FieldURI');
+        $index = $path->getAttribute('FieldIndex');
+        $addressParts = ['Street' => 'street', 'City' => 'locality', 'State' => 'region', 'Country' => 'country', 'PostalCode' => 'postcode'];
+        $phones = ['BusinessPhone', 'BusinessPhone2', 'HomePhone', 'HomePhone2', 'MobilePhone', 'BusinessFax', 'HomeFax', 'OtherFax', 'OtherTelephone', 'Pager'];
+        $part = null;
+        if ($uri === 'contacts:EmailAddress' && preg_match('/^EmailAddress[1-3]$/D', $index)) {
+            $map = 'emails'; $container = 'EmailAddresses';
+        } elseif ($uri === 'contacts:PhoneNumber' && in_array($index, $phones, true)) {
+            $map = 'phones'; $container = 'PhoneNumbers';
+        } elseif ($uri === 'contacts:ImAddress' && preg_match('/^ImAddress[1-3]$/D', $index)) {
+            $map = 'onlineServices'; $container = 'ImAddresses';
+        } elseif (preg_match('/^contacts:PhysicalAddress:(Street|City|State|Country|PostalCode)$/D', $uri, $m) && in_array($index, ['Business', 'Home', 'Other'], true)) {
+            $map = 'addresses'; $container = 'PhysicalAddresses'; $part = $addressParts[$m[1]];
+        } else {
+            throw new DomainException('Unsupported indexed contact property or index');
+        }
+        $delete = $field->localName === 'DeleteItemField';
+        if (count($children) !== ($delete ? 1 : 2) || $path->childElementCount !== 0) throw new DomainException('Invalid indexed update structure');
+        $value = null;
+        if (!$delete) {
+            $contact = $children[1];
+            if ($contact->namespaceURI !== EwsSoap::NS_T || $contact->localName !== 'Contact') throw new DomainException('Expected Contact value');
+            $this->validateContactIndexedXml($contact, []);
+            $containers = [];
+            foreach ($contact->childNodes as $node) if ($node instanceof DOMElement) $containers[] = $node;
+            if (count($containers) !== 1 || $containers[0]->namespaceURI !== EwsSoap::NS_T || $containers[0]->localName !== $container) throw new DomainException('Invalid contact dictionary');
+            $this->validateContactIndexedXml($containers[0], []);
+            $entries = [];
+            foreach ($containers[0]->childNodes as $node) if ($node instanceof DOMElement) $entries[] = $node;
+            if (count($entries) !== 1 || $entries[0]->namespaceURI !== EwsSoap::NS_T || $entries[0]->localName !== 'Entry' || $entries[0]->getAttribute('Key') !== $index) throw new DomainException('Invalid contact dictionary entry');
+            $entry = $entries[0];
+            $this->validateContactIndexedXml($entry, ['Key'], $part === null);
+            if ($part !== null) {
+                $parts = [];
+                foreach ($entry->childNodes as $node) if ($node instanceof DOMElement) $parts[] = $node;
+                $element = $m[1] === 'Country' ? 'CountryOrRegion' : $m[1];
+                if (count($parts) !== 1 || $parts[0]->namespaceURI !== EwsSoap::NS_T || $parts[0]->localName !== $element || $parts[0]->childElementCount) throw new DomainException('Invalid physical address value');
+                $entry = $parts[0];
+                $this->validateContactIndexedXml($entry, [], true);
+            } elseif ($entry->childElementCount) throw new DomainException('Invalid dictionary value');
+            $value = trim($entry->textContent);
+            if ($value === '') throw new DomainException('Empty indexed value; use DeleteItemField');
+            if ($map === 'onlineServices' && !preg_match('/^(?:im|xmpp|sip|sips|matrix):/i', $value)) throw new DomainException('IM address must have a supported URI scheme');
+        }
+        return compact('map', 'index', 'part', 'delete', 'value');
+    }
+
+    private function validateContactIndexedXml(DOMElement $element, array $attributes, bool $allowText = false): void {
+        foreach ($element->attributes as $attribute) {
+            if ($attribute->namespaceURI === 'http://www.w3.org/2000/xmlns/') continue;
+            if ($attribute->namespaceURI || !in_array($attribute->localName, $attributes, true)) throw new DomainException('Unsupported indexed update attribute');
+        }
+        if (!$allowText) foreach ($element->childNodes as $node) {
+            if (($node instanceof DOMText || $node instanceof DOMCdataSection) && trim($node->textContent) !== '') throw new DomainException('Unexpected indexed update text');
+        }
+    }
+
+    // Mirror contactToXml's selection exactly, retaining the original map keys.
+    private function contactIndexedSlots(string $map, array $entries): array {
+        $slots = [];
+        ksort($entries, SORT_STRING);
+        if ($map === 'emails') {
+            $keys = array_keys($entries);
+            usort($keys, fn($a, $b) => (int)(($entries[$b]['contexts']['work'] ?? false) === true) - (int)(($entries[$a]['contexts']['work'] ?? false) === true));
+            foreach ($keys as $key) if (is_string($entries[$key]['address'] ?? null) && $entries[$key]['address'] !== '' && count($slots) < 3) $slots['EmailAddress' . (count($slots) + 1)] = $key;
+        } elseif ($map === 'onlineServices') {
+            foreach ($entries as $key => $entry) if (is_string($entry['uri'] ?? null) && preg_match('/^(?:im|xmpp|sip|sips|matrix):/i', $entry['uri']) && count($slots) < 3) $slots['ImAddress' . (count($slots) + 1)] = $key;
+        } elseif ($map === 'phones') {
+            foreach ($entries as $key => $entry) {
+                if (!is_string($entry['number'] ?? null) || $entry['number'] === '') continue;
+                $ctx = $entry['contexts'] ?? []; $feat = $entry['features'] ?? [];
+                $work = ($ctx['work'] ?? false) === true; $home = ($ctx['home'] ?? false) === true || ($ctx['private'] ?? false) === true;
+                if (($feat['cell'] ?? false) === true || ($feat['mobile'] ?? false) === true) $candidates = ['MobilePhone'];
+                elseif (($feat['fax'] ?? false) === true) $candidates = [$work ? 'BusinessFax' : ($home ? 'HomeFax' : 'OtherFax')];
+                elseif (($feat['pager'] ?? false) === true) $candidates = ['Pager'];
+                elseif ($work) $candidates = ['BusinessPhone', 'BusinessPhone2'];
+                elseif ($home) $candidates = ['HomePhone', 'HomePhone2'];
+                else $candidates = ['OtherTelephone'];
+                foreach ($candidates as $candidate) if (!array_key_exists($candidate, $slots)) { $slots[$candidate] = $key; break; }
+            }
+        } else {
+            foreach ($entries as $key => $entry) {
+                $ctx = $entry['contexts'] ?? [];
+                $index = ($ctx['work'] ?? false) === true ? 'Business' : ((($ctx['home'] ?? false) === true || ($ctx['private'] ?? false) === true) ? 'Home' : 'Other');
+                if (array_key_exists($index, $slots)) continue;
+                $parsed = ['street' => '', 'locality' => '', 'region' => '', 'postcode' => '', 'country' => ''];
+                foreach ($entry['components'] ?? [] as $component) {
+                    $v = $component['value'] ?? ''; $kind = $component['kind'] ?? '';
+                    if (in_array($kind, ['street', 'number', 'name'], true)) $parsed['street'] .= ($parsed['street'] ? ', ' : '') . $v;
+                    elseif ($kind === 'locality') $parsed['locality'] = $v;
+                    elseif ($kind === 'region') $parsed['region'] = $v;
+                    elseif (in_array($kind, ['postcode', 'postalCode'], true)) $parsed['postcode'] = $v;
+                    elseif (in_array($kind, ['country', 'countryName'], true)) $parsed['country'] = $v;
+                }
+                foreach ($parsed as $v) if ($v !== '') { $slots[$index] = $key; break; }
+            }
+        }
+        return $slots;
+    }
+
+    private function mergeContactIndexed(array $card, array $changes, bool $hasChangeKey): array {
+        $maps = []; $slots = []; $seen = []; $created = []; $touched = [];
+        foreach ($changes as $change) {
+            ['map' => $map, 'index' => $index, 'part' => $part, 'delete' => $delete, 'value' => $value] = $change;
+            $identity = $map . '/' . $index . '/' . ($part ?? '');
+            if (isset($seen[$identity])) throw new DomainException('Duplicate indexed update');
+            $seen[$identity] = true;
+            if (!array_key_exists($map, $maps)) {
+                if (isset($card['localizations']) && !is_array($card['localizations'])) throw new DomainException('Unsupported contact localizations');
+                foreach (($card['localizations'] ?? []) as $localization) {
+                    if (!is_array($localization)) throw new DomainException('Unsupported contact localizations');
+                    foreach ($localization as $path => $_) if ($path === $map || str_starts_with((string)$path, $map . '/')) throw new DomainException('Localized contact data cannot be safely updated');
+                }
+                $maps[$map] = $card[$map] ?? [];
+                if (!is_array($maps[$map])) throw new DomainException('Unsupported contact dictionary');
+                foreach ($maps[$map] as $entry) {
+                    if (!is_array($entry) || (isset($entry['contexts']) && !is_array($entry['contexts'])) || (isset($entry['features']) && !is_array($entry['features'])) || (isset($entry['components']) && !is_array($entry['components']))) throw new DomainException('Unsupported contact dictionary entry');
+                    foreach ($entry['components'] ?? [] as $component) if (!is_array($component) || !is_string($component['value'] ?? null)) throw new DomainException('Unsupported address component');
+                }
+                $slots[$map] = $this->contactIndexedSlots($map, $maps[$map]);
+            }
+            if (!$hasChangeKey && array_key_exists($index, $slots[$map])) throw new DomainException('ChangeKey required to update an existing indexed contact slot', 1);
+            $key = $slots[$map][$index] ?? $created[$map][$index] ?? null;
+            if ($key === null) {
+                if ($delete) throw new DomainException('Indexed contact field does not exist');
+                $keys = array_map('strval', array_keys($maps[$map]));
+                sort($keys, SORT_STRING); $last = $keys ? end($keys) : '';
+                $key = 'z';
+                while (strcmp($key, $last) <= 0) {
+                    $key .= 'z';
+                    if (strlen($key) > 255) throw new DomainException('Cannot safely allocate indexed contact key');
+                }
+                $entry = [];
+                if ($map === 'addresses') {
+                    $entry = ['@type' => 'Address', 'components' => []];
+                    if ($index !== 'Other') $entry['contexts'] = [$index === 'Business' ? 'work' : 'home' => true];
+                } elseif ($map === 'phones') {
+                    if (str_starts_with($index, 'Business')) $entry['contexts'] = ['work' => true];
+                    elseif (str_starts_with($index, 'Home')) $entry['contexts'] = ['home' => true];
+                    if ($index === 'MobilePhone') $entry['features'] = ['cell' => true];
+                    elseif (str_ends_with($index, 'Fax')) $entry['features'] = ['fax' => true];
+                    elseif ($index === 'Pager') $entry['features'] = ['pager' => true];
+                }
+                $maps[$map][$key] = $entry; $created[$map][$index] = $key;
+            }
+            $touched[$map][$key] = true;
+            if ($part !== null) {
+                $entry =& $maps[$map][$key];
+                if (isset($entry['full'])) throw new DomainException('Formatted address cannot be safely updated');
+                $components = $entry['components'] ?? [];
+                if (!array_is_list($components)) throw new DomainException('Unsupported address components');
+                $aliases = match ($part) { 'street' => ['street', 'number', 'name'], 'postcode' => ['postcode', 'postalCode'], 'country' => ['country', 'countryName'], default => [$part] };
+                $matches = [];
+                foreach ($components as $i => $component) if (in_array($component['kind'] ?? '', $aliases, true)) $matches[] = $i;
+                if (count($matches) > 1 || ($matches && $part === 'street' && $components[$matches[0]]['kind'] !== 'street')) throw new DomainException('Ambiguous address component');
+                if ($delete && !$matches) throw new DomainException('Address component does not exist');
+                if ($matches) {
+                    $i = $matches[0];
+                    if ($delete) {
+                        if (array_diff(array_keys($components[$i]), ['kind', 'value', '@type'])) throw new DomainException('Address component metadata cannot be removed');
+                        array_splice($components, $i, 1);
+                    } else {
+                        if (isset($components[$i]['phonetic'])) throw new DomainException('Phonetic address component cannot be updated');
+                        $components[$i]['value'] = $value;
+                    }
+                } else $components[] = ['kind' => $part, 'value' => $value];
+                $entry['components'] = $components;
+                unset($entry);
+            } else {
+                $property = $map === 'emails' ? 'address' : ($map === 'phones' ? 'number' : 'uri');
+                if ($delete) {
+                    $allowed = [$property, '@type'];
+                    if ($map === 'phones') $allowed = array_merge($allowed, ['contexts', 'features']);
+                    if ($map === 'emails') $allowed[] = 'contexts';
+                    if (array_diff(array_keys($maps[$map][$key]), $allowed)) throw new DomainException('Contact entry metadata cannot be removed');
+                    foreach (['contexts' => ['work', 'home', 'private'], 'features' => ['cell', 'mobile', 'fax', 'pager']] as $propertyName => $allowedKeys) {
+                        foreach ($maps[$map][$key][$propertyName] ?? [] as $k => $v) if (!in_array($k, $allowedKeys, true) || $v !== true) throw new DomainException('Contact entry metadata cannot be removed');
+                    }
+                    unset($maps[$map][$key]);
+                } else $maps[$map][$key][$property] = $value;
+            }
+        }
+        foreach ($created as $map => $indexes) {
+            $finalSlots = $this->contactIndexedSlots($map, $maps[$map]);
+            foreach ($indexes as $index => $key) if (($finalSlots[$index] ?? null) !== $key) throw new DomainException('Cannot create an unrepresentable indexed slot');
+        }
+        // Do not let deletion or insertion silently retarget another EWS slot,
+        // including promotion of entries previously hidden by the converter.
+        foreach ($maps as $map => $entries) {
+            $finalSlots = $this->contactIndexedSlots($map, $entries);
+            foreach ($slots[$map] as $index => $oldKey) {
+                if (array_key_exists($oldKey, $entries) && ($finalSlots[$index] ?? null) !== $oldKey) {
+                    // An address can remain in the map after its last visible
+                    // component is deleted; it must not promote a replacement.
+                    if ($map !== 'addresses' || in_array($oldKey, $finalSlots, true) || isset($finalSlots[$index])) throw new DomainException('Contact update would shift indexed slots');
+                }
+                if (isset($finalSlots[$index]) && $finalSlots[$index] !== $oldKey) throw new DomainException('Contact update would shift indexed slots');
+            }
+            foreach ($finalSlots as $index => $key) {
+                if (!isset($slots[$map][$index]) && array_key_exists($key, $card[$map] ?? []) && !in_array($key, $slots[$map], true)) throw new DomainException('Contact update would expose a hidden indexed entry');
+            }
+        }
+        $patch = [];
+        foreach ($maps as $map => $entries) {
+            if (!isset($card[$map])) {
+                $patch[$map] = (object)$entries;
+                continue;
+            }
+            foreach ($touched[$map] as $key => $_) {
+                $path = $map . '/' . str_replace(['~', '/'], ['~0', '~1'], (string)$key);
+                if (!array_key_exists($key, $entries)) $patch[$path] = null;
+                elseif (!array_key_exists($key, $card[$map])) $patch[$path] = $entries[$key];
+                else {
+                    $property = match ($map) { 'emails' => 'address', 'phones' => 'number', 'onlineServices' => 'uri', default => 'components' };
+                    $patch[$path . '/' . $property] = $entries[$key][$property];
+                }
+            }
+        }
+        return $patch;
     }
 
     private function mergeContactName(array $card, array $changes): ?array {
@@ -2022,103 +2339,64 @@ class EwsOperations {
         return $result;
     }
 
-    private function updateCalendarEvent(string $id, DOMElement $updates): string {
-        $jmapId = $this->jmapId($id);
-        $patch = [];
-
-        $setFieldEls = $updates->getElementsByTagNameNS(EwsSoap::NS_T, 'SetItemField');
-        for ($i = 0; $i < $setFieldEls->length; $i++) {
-            $field = $setFieldEls->item($i);
-            $path = EwsSoap::getFirstChild($field, 'FieldURI');
-            $fieldUri = $path ? $path->getAttribute('FieldURI') : '';
-            $valueEl = EwsSoap::getFirstChild($field, 'CalendarItem');
-
-            if (!$fieldUri || !$valueEl) continue;
-
-            switch ($fieldUri) {
-                case 'calendar:Subject':
-                    $patch['title'] = trim($valueEl->textContent);
-                    break;
-                case 'calendar:Start':
-                    $patch['start'] = gmdate('Y-m-d\TH:i:s', strtotime(trim($valueEl->textContent)));
-                    break;
-                case 'calendar:End':
-                    if (isset($patch['start'])) {
-                        $startTs = strtotime($patch['start']);
-                        $endTs   = strtotime(trim($valueEl->textContent));
-                        $patch['duration'] = JmapCalendarConverter::secondsToDuration(max(60, $endTs - $startTs));
-                    }
-                    break;
-                case 'calendar:Location':
-                    $patch['locations'] = ['l1' => ['@type' => 'Location', 'name' => trim($valueEl->textContent)]];
-                    break;
-                case 'calendar:IsAllDayEvent':
-                    $patch['showWithoutTime'] = strtolower(trim($valueEl->textContent)) === 'true';
-                    break;
-                case 'calendar:LegacyFreeBusyStatus':
-                    $status = match(strtolower(trim($valueEl->textContent))) {
-                        'free'         => 'free',
-                        'tentative'    => 'tentative',
-                        'oof'          => 'unavailable',
-                        'workingelse'  => 'busy',
-                        default        => 'busy',
-                    };
-                    $patch['freeBusyStatus'] = $status;
-                    break;
-                case 'calendar:ReminderMinutesBeforeStart':
-                    $mins = (int)trim($valueEl->textContent);
-                    if ($mins > 0) {
-                        $patch['alerts'] = ['al1' => [
-                            '@type'   => 'Alert',
-                            'trigger' => [
-                                '@type'      => 'OffsetTrigger',
-                                'offset'     => '-PT' . $mins . 'M',
-                                'relativeTo' => 'start',
-                            ],
-                            'action'  => 'display',
-                        ]];
-                    }
-                    break;
-                case 'calendar:Sensitivity':
-                    $sensitivity = match(strtolower(trim($valueEl->textContent))) {
-                        'private'       => 'private',
-                        'confidential'  => 'confidential',
-                        default         => 'public',
-                    };
-                    $patch['privacy'] = $sensitivity;
-                    break;
-                case 'calendar:Categories':
-                    break;
+    private function rejectOccurrenceIds(DOMElement $request): void {
+        foreach (['OccurrenceItemId', 'RecurringMasterItemId', 'RecurringMasterItemIdRanges'] as $name) {
+            if ($request->getElementsByTagNameNS(EwsSoap::NS_T, $name)->length) {
+                throw new EwsCalendarSafetyException('Calendar occurrence and master IDs are not supported');
             }
         }
+    }
 
-        if (empty($patch)) {
-            return '<m:ItemResponseMessage ResponseClass="Success">' .
-                '<m:ResponseCode>NoError</m:ResponseCode>' .
-                EwsSoap::buildId(new DOMDocument(), $id, $jmapId) .
-                '</m:ItemResponseMessage>';
+    private function rejectCalendarContext(DOMElement $request): void {
+        if ($request->ownerDocument->getElementsByTagNameNS(EwsSoap::NS_T, 'TimeZoneContext')->length) {
+            throw new EwsCalendarSafetyException('Calendar time-zone context is not supported');
         }
+    }
 
-        try {
-            $r = $this->client->call([
-                ['CalendarEvent/set', [
-                    'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
-                    'update'    => [$jmapId => $patch],
-                ], '0'],
-            ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
-
-            $success = isset($r[0][1]['updated'][$jmapId]);
-            return '<m:ItemResponseMessage ResponseClass="' . ($success ? 'Success' : 'Error') . '">' .
-                '<m:MessageText></m:MessageText>' .
-                '<m:ResponseCode>' . ($success ? 'NoError' : 'ErrorItemNotFound') . '</m:ResponseCode>' .
-                EwsSoap::buildId(new DOMDocument(), $id, $jmapId) .
-                '</m:ItemResponseMessage>';
-        } catch (\Throwable $e) {
-            return '<m:ItemResponseMessage ResponseClass="Error">' .
-                '<m:MessageText>' . EwsSoap::escapeXml($e->getMessage()) . '</m:MessageText>' .
-                '<m:ResponseCode>ErrorInternalServerError</m:ResponseCode>' .
-                '</m:ItemResponseMessage>';
+    private function calendarUpdatePatch(DOMElement $updates): array {
+        $patch = [];
+        foreach ($updates->childNodes as $field) {
+            if (!$field instanceof DOMElement) continue;
+            if ($field->namespaceURI !== EwsSoap::NS_T || $field->localName !== 'SetItemField') throw new EwsCalendarSafetyException('Unsupported calendar update operation');
+            $children = [];
+            foreach ($field->childNodes as $child) if ($child instanceof DOMElement) $children[] = $child;
+            if (count($children) !== 2 || $children[0]->namespaceURI !== EwsSoap::NS_T || $children[0]->localName !== 'FieldURI' ||
+                $children[1]->namespaceURI !== EwsSoap::NS_T || $children[1]->localName !== 'CalendarItem') throw new EwsCalendarSafetyException('Invalid calendar update');
+            $uri = $children[0]->getAttribute('FieldURI');
+            $names = ['item:Subject' => ['Subject', 'title'], 'calendar:Subject' => ['Subject', 'title']];
+            if (!isset($names[$uri])) throw new EwsCalendarSafetyException('Unsupported calendar property: ' . $uri);
+            [$name, $property] = $names[$uri];
+            $values = [];
+            foreach ($children[1]->childNodes as $value) if ($value instanceof DOMElement) $values[] = $value;
+            if (count($values) !== 1 || $values[0]->namespaceURI !== EwsSoap::NS_T || $values[0]->localName !== $name || $values[0]->firstElementChild || array_key_exists($property, $patch)) {
+                throw new EwsCalendarSafetyException('Invalid calendar property value');
+            }
+            $patch[$property] = trim($values[0]->textContent);
         }
+        if (!$patch) throw new EwsCalendarSafetyException('No supported calendar updates');
+        return $patch;
+    }
+
+    private function updateCalendarEvent(string $id, DOMElement $updates, string $changeKey): string {
+        $jmapId = $this->jmapId($id);
+        $patch = $this->calendarUpdatePatch($updates);
+        $account = $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS);
+        $using = [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS];
+        $r = $this->client->call([['CalendarEvent/get', ['accountId' => $account, 'ids' => [$jmapId], 'properties' => null], '0']], $using);
+        $data = $r[0][1] ?? null;
+        if (($r[0][0] ?? null) !== 'CalendarEvent/get' || ($r[0][2] ?? null) !== '0' || !is_array($data) ||
+            ($data['accountId'] ?? null) !== $account || !is_string($data['state'] ?? null) || $data['state'] === '' ||
+            !is_array($data['list'] ?? null) || count($data['list']) !== 1 || ($data['list'][0]['id'] ?? null) !== $jmapId || ($data['notFound'] ?? null) !== []) {
+            throw new RuntimeException('Calendar read failed');
+        }
+        EwsConverter::safeCalendarTimes($data['list'][0]);
+        if ($changeKey !== '' && !hash_equals(EwsConverter::itemChangeKey($data['list'][0]), $changeKey)) return $this->contactUpdateError('ErrorIrresolvableConflict', 'Calendar item changed');
+        $r = $this->client->call([['CalendarEvent/set', ['accountId' => $account, 'ifInState' => $data['state'], 'update' => [$jmapId => $patch]], '0']], $using);
+        $result = $r[0][1] ?? [];
+        if (($r[0][0] ?? null) === 'error' && ($result['type'] ?? '') === 'stateMismatch') return $this->contactUpdateError('ErrorIrresolvableConflict', 'Calendar changed during update');
+        if (($r[0][0] ?? null) !== 'CalendarEvent/set' || !is_array($result['updated'] ?? null) || !array_key_exists($jmapId, $result['updated'])) return $this->contactUpdateError('ErrorInternalServerError', 'Calendar update failed');
+        return '<m:ItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode>' .
+            EwsSoap::buildId(new DOMDocument(), $id, $jmapId) . '</m:ItemResponseMessage>';
     }
 
     private function updateEmail(string $id, DOMElement $updates): string {

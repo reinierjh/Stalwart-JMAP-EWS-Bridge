@@ -179,7 +179,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "3d15fa3c5a41ae83906a2401896cd5c9fa4b5c4280f274361991d4125b7c7863"
+          "content": "fcbaabf739c49a5e47ce417180cac1da1df07b7411cda4ad0d0e41232182ec3c"
         }
       ]
     },
@@ -191,7 +191,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "7623730ce0cf1c5a68e936f34f88b56dd84bc76c8f82c7a745db2223ea508a4f"
+          "content": "e53d62e76d9d9c1b16ce0cd9c6df9484029169ea04c4832d1e63147ca5eec5ba"
         }
       ]
     },
@@ -227,7 +227,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "f36de52b4301c3d92998ef36916c0c87eb8913a7712a88033aa1c72beef4c454"
+          "content": "54930cd924cd503c64689b7bcdaa75c898432c3010a5dbe13858c86be393a13d"
         }
       ]
     },
@@ -293,6 +293,30 @@
     },
     {
       "type": "file",
+      "bom-ref": "file:tests/calendar_conversion.php",
+      "name": "tests/calendar_conversion.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f2ae14d3d8499e8cb57bf54dd4795c871d013f0f38e58d278d59b15faaa0b7ed"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/calendar_safety.php",
+      "name": "tests/calendar_safety.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "696da33887b7b86297947599485d5f5d6fd3d806ac1dc534c3db5520158a167e"
+        }
+      ]
+    },
+    {
+      "type": "file",
       "bom-ref": "file:tests/capability_accounts.php",
       "name": "tests/capability_accounts.php",
       "description": "Repository source file.",
@@ -317,6 +341,18 @@
     },
     {
       "type": "file",
+      "bom-ref": "file:tests/contact_indexed_update.php",
+      "name": "tests/contact_indexed_update.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "b2e354b02769bd4baf97b1b5c0c5eb4582b13e36be35807159463a29c3f44f31"
+        }
+      ]
+    },
+    {
+      "type": "file",
       "bom-ref": "file:tests/contact_schema.php",
       "name": "tests/contact_schema.php",
       "description": "Repository source file.",
@@ -335,7 +371,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "1c1fa18389fcbeb1df5aac805b6ac92d4f2215ab46768cf35cf2f34eed4eed45"
+          "content": "83790703d407c5c72056d7bae687f41783ec0e934c780362e468df09dd60cf55"
         }
       ]
     },
@@ -347,7 +383,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "99a922648e6bf343c97f2b05e71872bd284a004c0b1315878d84b2d54378118f"
+          "content": "ec1ebfb9f0ea39509daf62ad15349a3df60311b4fd1be0839a943310f7e7ee08"
         }
       ]
     },
@@ -383,7 +419,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "f00dae12234b4b3d93f31627f06cf21e005a5fba0f1eebd0161c8d97456332f7"
+          "content": "37313670eeab638ff3fa53c95648c62f115b5decd7a28a3d4c9ca3db871d5ccf"
         }
       ]
     },
@@ -520,8 +556,11 @@
       "dependsOn": [
         "bridge",
         "curl-cli",
+        "file:tests/calendar_conversion.php",
+        "file:tests/calendar_safety.php",
         "file:tests/capability_accounts.php",
         "file:tests/contact_converter.php",
+        "file:tests/contact_indexed_update.php",
         "file:tests/contact_schema.php",
         "file:tests/contact_update.php",
         "file:tests/converter_versions.php",

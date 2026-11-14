@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../ews/src/SqliteSyncStore.php';
+require_once __DIR__ . '/../ews/src/Converter.php';
 
 function sqlCheck(bool $ok, string $message): void { if (!$ok) throw new RuntimeException($message); }
 function sqlFails(callable $f, string $class): void {
@@ -266,6 +267,89 @@ try {
         sqlCheck((int)$probe->query('SELECT count(*) FROM item_versions')->fetchColumn() === $remaining, 'GC deletion rolled back after crash');
         unset($probe); $q->gcAll();
     } finally { unset($q, $probe); sqlRemove($gcCrashRoot); }
+    $boundaryRoot = $root . '-initial-gc-boundary';
+    try {
+        $boundaryTime = 6000000; $boundaryClock = function () use (&$boundaryTime): int { return $boundaryTime; };
+        $boundaryLimits = ['ttl' => 10, 'initialWindow' => 10, 'gcBatch' => 1];
+        $q = new SqliteSyncStore($boundaryRoot, $boundaryLimits, $boundaryClock);
+        $q->advance($scope, null, [], 2, array_slice($records, 0, 2), array_slice($changes, 0, 2));
+        $boundaryTime += 10; $q->gc('server', 'alice');
+        $probe = new PDO('sqlite:' . $boundaryRoot . '/sync.sqlite3');
+        sqlCheck((int)$probe->query('SELECT gc_pending FROM runs')->fetchColumn() === 1 &&
+            (int)$probe->query('SELECT count(*) FROM changes')->fetchColumn() === 1, 'initial run marked before partial GC');
+        sqlCheck($q->existingRun($scope, null, [], 2) === null, 'expiry boundary excluded from initial reuse');
+        $boundaryTime--; // Even a backwards clock cannot resurrect a collected run.
+        sqlCheck($q->existingRun($scope, null, [], 2) === null, 'GC marker prevents reuse after clock rollback');
+        $fresh = [['id' => 'fresh', 'changeKey' => 'fresh-key', 'object' => ['id' => 'fresh']]];
+        $new = $q->advance($scope, null, [], 2, $fresh, [['kind' => 'Create', 'id' => 'fresh']]);
+        $page = $q->page($scope, $new, [], 2);
+        sqlCheck($page['done'] && count($page['changes']) === 1 && $page['changes'][0]['id'] === 'fresh', 'new correct initial run after partial GC');
+        unset($probe);
+    } finally { unset($q, $probe); sqlRemove($boundaryRoot); }
+    $markCrashRoot = $root . '-initial-gc-crash';
+    try {
+        $markTime = 6100000; $markClock = function () use (&$markTime): int { return $markTime; };
+        $markLimits = ['ttl' => 10, 'initialWindow' => 10, 'gcBatch' => 1];
+        $q = new SqliteSyncStore($markCrashRoot, $markLimits, $markClock);
+        $q->advance($scope, null, [], 2, array_slice($records, 0, 2), array_slice($changes, 0, 2));
+        unset($q); $markTime += 10;
+        $pid = pcntl_fork(); if ($pid === -1) throw new RuntimeException('fork failed');
+        if ($pid === 0) {
+            $child = new SqliteSyncStore($markCrashRoot, $markLimits, $markClock, function ($phase): void {
+                if ($phase === 'gcAfterRunMarked') { posix_kill(getmypid(), SIGKILL); usleep(500000); }
+            });
+            $child->gc('server', 'alice'); exit(99);
+        }
+        pcntl_waitpid($pid, $status); sqlCheck(pcntl_wifsignaled($status) && pcntl_wtermsig($status) === SIGKILL, 'GC marker crash');
+        $q = new SqliteSyncStore($markCrashRoot, $markLimits, $markClock);
+        $probe = new PDO('sqlite:' . $markCrashRoot . '/sync.sqlite3');
+        sqlCheck((int)$probe->query('SELECT gc_pending FROM runs')->fetchColumn() === 0 && (int)$probe->query('SELECT count(*) FROM changes')->fetchColumn() === 2, 'GC marker and changes roll back together');
+        sqlCheck($q->existingRun($scope, null, [], 2) === null, 'crash cannot reuse expired initial run');
+        $q->gc('server', 'alice');
+        sqlCheck((int)$probe->query('SELECT gc_pending FROM runs')->fetchColumn() === 1 && $q->existingRun($scope, null, [], 2) === null, 'committed partial GC cannot be reused');
+        unset($probe);
+    } finally { unset($q, $probe); sqlRemove($markCrashRoot); }
+    $markRaceRoot = $root . '-initial-gc-race'; $gcPid = null; $releasePid = null;
+    try {
+        $markTime = 6200000; $markClock = function () use (&$markTime): int { return $markTime; };
+        $markLimits = ['ttl' => 10, 'initialWindow' => 10, 'gcBatch' => 1];
+        $q = new SqliteSyncStore($markRaceRoot, $markLimits, $markClock);
+        $q->advance($scope, null, [], 2, array_slice($records, 0, 2), array_slice($changes, 0, 2));
+        unset($q); $markTime += 10;
+        $gcPid = pcntl_fork(); if ($gcPid === -1) throw new RuntimeException('fork failed');
+        if ($gcPid === 0) {
+            try {
+                $child = new SqliteSyncStore($markRaceRoot, $markLimits, $markClock, function ($phase) use ($markRaceRoot): void {
+                    if ($phase !== 'gcAfterRunMarked') return;
+                    file_put_contents($markRaceRoot . '/gc-ready', '1'); $start = hrtime(true);
+                    while (!is_file($markRaceRoot . '/gc-release')) {
+                        if (hrtime(true) - $start > 10000000000) throw new RuntimeException('GC race timeout');
+                        usleep(1000);
+                    }
+                });
+                while (!is_file($markRaceRoot . '/gc-start')) usleep(1000);
+                $child->gc('server', 'alice'); exit(0);
+            } catch (Throwable $e) { fwrite(STDERR, 'GC race: ' . get_class($e) . "\n"); exit(1); }
+        }
+        $q = new SqliteSyncStore($markRaceRoot, $markLimits, $markClock);
+        file_put_contents($markRaceRoot . '/gc-start', '1'); $start = hrtime(true);
+        while (!is_file($markRaceRoot . '/gc-ready')) {
+            if (hrtime(true) - $start > 10000000000) throw new RuntimeException('GC race did not start');
+            usleep(1000);
+        }
+        $releasePid = pcntl_fork(); if ($releasePid === -1) throw new RuntimeException('fork failed');
+        if ($releasePid === 0) { usleep(50000); file_put_contents($markRaceRoot . '/gc-release', '1'); exit(0); }
+        sqlCheck($q->existingRun($scope, null, [], 2) === null, 'concurrent GC cannot resurrect partial initial run');
+        pcntl_waitpid($releasePid, $status); $releasePid = null;
+        pcntl_waitpid($gcPid, $status); $gcPid = null;
+        sqlCheck(pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0, 'concurrent GC committed');
+        $fresh = [['id' => 'race-fresh', 'changeKey' => 'key', 'object' => ['id' => 'race-fresh']]];
+        $new = $q->advance($scope, null, [], 2, $fresh, [['kind' => 'Create', 'id' => 'race-fresh']]);
+        sqlCheck($q->page($scope, $new, [], 2)['changes'][0]['id'] === 'race-fresh', 'concurrent GC produces new complete initial');
+    } finally {
+        foreach ([$gcPid, $releasePid] as $child) if (is_int($child) && $child > 0) { posix_kill($child, SIGKILL); pcntl_waitpid($child, $status); }
+        unset($q); sqlRemove($markRaceRoot);
+    }
     // More than 100 changed generations must retain old versions without copying
     // every large object into every snapshot or exhausting this deliberately low quota.
     $sharingRoot = $root . '-sharing';
@@ -323,6 +407,60 @@ try {
         printf("sharing generations=111 items=1000 versions=1110 references=%d initial_logical=%d final_logical=%d\n", $references, $initialBytes, $finalBytes);
         unset($probe);
     } finally { unset($share, $probe); sqlRemove($sharingRoot); }
+    // Compare stored canonical bytes with the real converter while keeping the
+    // standalone store independent of it. Re-add an old version after deletion.
+    $canonicalRoot = $root . '-canonical';
+    try {
+        $q = new SqliteSyncStore($canonicalRoot, ['ttl' => 100, 'initialWindow' => 10], $clock);
+        $ascending = []; $reverse = []; $zigzag = [];
+        for ($i = 0; $i < 14; $i++) $ascending[$i] = 'value-' . $i;
+        for ($i = 13; $i >= 0; $i--) $reverse[(string)$i] = 'value-' . $i;
+        foreach ([10, 2, 13, 0, 8, 5, 12, 1, 7, 4, 9, 3, 11, 6] as $i) $zigzag[$i] = 'value-' . $i;
+        $mapA = [10 => 'ten', '01' => 'leading', -2 => 'negative', 2 => 'two', 'alpha' => 'a'];
+        $mapB = ['alpha' => 'a', 2 => 'two', -2 => 'negative', '01' => 'leading', 10 => 'ten'];
+        $objA = (object)['z' => 2, 'a' => 1]; $objB = (object)['a' => 1, 'z' => 2];
+        $a = ['id' => 'canonical', 'numeric' => $reverse, 'sparse' => [9 => 'nine', 2 => 'two', -1 => 'minus'],
+            'map' => $mapA, 'list' => ['first', 'second'], 'object' => $objA, 'emptyObject' => (object)[],
+            'numericObject' => (object)$reverse, 'nested' => ['bodyValues' => ['kept' => true]],
+            'bodyValues' => ['part' => ['value' => 'transient-a']]];
+        $b = ['bodyValues' => ['part' => ['value' => 'transient-b']], 'id' => 'canonical', 'numeric' => $ascending,
+            'sparse' => [-1 => 'minus', 2 => 'two', 9 => 'nine'], 'map' => $mapB, 'list' => ['first', 'second'],
+            'object' => $objB, 'emptyObject' => (object)[], 'numericObject' => (object)$ascending, 'nested' => ['bodyValues' => ['kept' => true]]];
+        $c = $b; $c['numeric'] = $zigzag;
+        $key = EwsConverter::itemChangeKey($a);
+        sqlCheck($key === EwsConverter::itemChangeKey($b) && $key === EwsConverter::itemChangeKey($c), 'real converter normalizes equivalent numeric maps and bodyValues');
+        $otherObject = ['id' => 'other', 'subject' => 'one'];
+        $initial = [['id' => 'canonical', 'changeKey' => $key, 'object' => $a],
+            ['id' => 'other', 'changeKey' => EwsConverter::itemChangeKey($otherObject), 'object' => $otherObject]];
+        $t = $q->advance($scope, null, [], 10, $initial, [['kind' => 'Create', 'id' => 'canonical'], ['kind' => 'Create', 'id' => 'other']]);
+        $t = $q->page($scope, $t, [], 10)['nextToken'];
+        $probe = new PDO('sqlite:' . $canonicalRoot . '/sync.sqlite3');
+        $sql = $probe->query("SELECT object_json,content_hash FROM item_versions WHERE item_id='canonical'")->fetch(PDO::FETCH_ASSOC);
+        sqlCheck($sql['content_hash'] === $key && hash('sha256', $sql['object_json']) === $key, 'stored bytes exactly match real converter hash');
+        $stored = json_decode($sql['object_json'], false, 512, JSON_THROW_ON_ERROR);
+        sqlCheck(!property_exists($stored, 'bodyValues') && $stored->nested->bodyValues->kept === true && $stored->numericObject instanceof stdClass, 'top-level bodyValues excluded, nested preserved, JSON object retained');
+        $otherObject['subject'] = 'two';
+        $target = [['id' => 'canonical', 'changeKey' => $key, 'object' => $b],
+            ['id' => 'other', 'changeKey' => EwsConverter::itemChangeKey($otherObject), 'object' => $otherObject]];
+        $run = $q->advance($scope, $t, [], 10, $target, [['kind' => 'Update', 'id' => 'other']]);
+        $t = $q->page($scope, $run, [], 10)['nextToken'];
+        $run = $q->advance($scope, $t, [], 10, [$target[1]], [['kind' => 'Delete', 'id' => 'canonical']]);
+        $t = $q->page($scope, $run, [], 10)['nextToken'];
+        $bad = $c; $bad['list'] = ['second', 'first'];
+        sqlCheck(EwsConverter::itemChangeKey($bad) !== $key, 'real lists retain ordering');
+        $badTarget = [['id' => 'canonical', 'changeKey' => $key, 'object' => $bad], $target[1]];
+        sqlFails(fn() => $q->advance($scope, $t, [], 10, $badTarget, [['kind' => 'Create', 'id' => 'canonical']]), InvalidArgumentException::class);
+        $readd = [['id' => 'canonical', 'changeKey' => $key, 'object' => $c], $target[1]];
+        $run = $q->advance($scope, $t, [], 10, $readd, [['kind' => 'Create', 'id' => 'canonical']]);
+        $page = $q->page($scope, $run, [], 10);
+        sqlCheck($page['done'] && $page['changes'][0]['record']['changeKey'] === $key, 're-added version is readable');
+        sqlCheck(EwsConverter::itemChangeKey($page['changes'][0]['record']['object']) === $key, 'page object preserves converter ChangeKey');
+        sqlCheck(EwsConverter::itemChangeKey($q->baseline($scope, $page['nextToken'])[0]['object']) === $key, 'baseline preserves converter ChangeKey');
+        sqlCheck((int)$probe->query("SELECT count(*) FROM item_versions WHERE item_id='canonical'")->fetchColumn() === 1, 'equivalent version shared without duplication');
+        $nested = $b; $nested['nested']['bodyValues']['kept'] = false;
+        sqlCheck(EwsConverter::itemChangeKey($nested) !== $key, 'nested bodyValues affects ChangeKey');
+        unset($probe);
+    } finally { unset($q, $probe); sqlRemove($canonicalRoot); }
     // 10k realistic JSON objects, real concurrent principal and deliberately held
     // writer: the WAL SELECT must finish before the writer is allowed to commit.
     $benchRoot = $root . '-bench';
@@ -398,12 +536,14 @@ try {
         if (is_int($pid) && $pid > 0) { posix_kill($pid, SIGKILL); pcntl_waitpid($pid, $status); }
         unset($reader); sqlRemove($benchRoot);
     }
-    $oldRoot = $root . '-v1';
-    try {
-        mkdir($oldRoot, 0700); $old = new PDO('sqlite:' . $oldRoot . '/sync.sqlite3');
-        chmod($oldRoot . '/sync.sqlite3', 0600); $old->exec('PRAGMA user_version=1'); unset($old);
-        sqlFails(fn() => new SqliteSyncStore($oldRoot), RuntimeException::class);
-    } finally { sqlRemove($oldRoot); }
+    foreach ([1, 2, 3] as $version) {
+        $oldRoot = $root . '-v' . $version;
+        try {
+            mkdir($oldRoot, 0700); $old = new PDO('sqlite:' . $oldRoot . '/sync.sqlite3');
+            chmod($oldRoot . '/sync.sqlite3', 0600); $old->exec('PRAGMA user_version=' . $version); unset($old);
+            sqlFails(fn() => new SqliteSyncStore($oldRoot), RuntimeException::class);
+        } finally { sqlRemove($oldRoot); }
+    }
     $path = $root . '/sync.sqlite3'; clearstatcache(true, $path);
     sqlCheck((fileperms($root) & 0777) === 0700 && (fileperms($path) & 0777) === 0600, 'private permissions');
     foreach (glob($path . '*') as $file) sqlCheck((fileperms($file) & 0777) === 0600, 'private database sidecar');
