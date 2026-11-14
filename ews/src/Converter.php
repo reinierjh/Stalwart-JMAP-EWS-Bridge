@@ -5,6 +5,42 @@ class EwsConverter {
     const PFX_CONTACTS = 'ab_';
     const PFX_CALENDAR = 'cal_';
 
+    /**
+     * Hash the complete JMAP item, independent of JSON object member ordering.
+     * Email bodyValues is the sole exception: it is a fetch-dependent, possibly
+     * truncated projection. The immutable message blobId/body structure remain
+     * in the hash. Callers must otherwise fetch the same complete properties.
+     */
+    public static function itemChangeKey(array $object): string {
+        unset($object['bodyValues']);
+        $json = json_encode(self::canonicalJsonObject($object), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
+        return hash('sha256', $json);
+    }
+
+    private static function canonicalJsonObject(array $object): object {
+        ksort($object, SORT_STRING);
+        foreach ($object as &$value) $value = self::canonicalJsonValue($value);
+        return (object)$object;
+    }
+
+    private static function canonicalJsonValue($value) {
+        if (is_array($value)) {
+            if (!array_is_list($value)) {
+                // Associative JSON decoding turns numeric object keys into PHP
+                // integers. Contiguous keys must normalize identically whether
+                // they arrived in index order or in a different map order.
+                $keys = array_keys($value);
+                sort($keys, SORT_REGULAR);
+                if ($keys !== range(0, count($keys) - 1)) return self::canonicalJsonObject($value);
+                ksort($value, SORT_NUMERIC);
+            }
+            return array_map([self::class, 'canonicalJsonValue'], $value);
+        }
+        if ($value instanceof stdClass) return self::canonicalJsonObject(get_object_vars($value));
+        if (is_object($value) || is_resource($value)) throw new InvalidArgumentException('Expected JSON-compatible item');
+        return $value;
+    }
+
     public static function folderToXml(DOMDocument $dom, array $folder, string $folderId, string $parentFolderId = '0', string $changeKey = ''): string {
         $localName = 'Folder';
         if (str_starts_with($folderId, self::PFX_CALENDAR)) {
@@ -51,14 +87,19 @@ class EwsConverter {
         };
     }
 
-    public static function emailToXml(DOMDocument $dom, array $email, string $folderId, array $bodyValues = []): string {
+    public static function emailToXml(DOMDocument $dom, array $email, string $folderId, array $bodyValues = [], ?string $mime = null): string {
         $id        = $email['id'] ?? '';
-        $changeKey = self::modHash($email);
+        $changeKey = self::itemChangeKey($email);
         $kw        = $email['keywords'] ?? [];
 
         $xml = '<t:Message>';
         $xml .= EwsSoap::buildId($dom, $id, $changeKey);
         $xml .= '<t:ParentFolderId Id="' . EwsSoap::escapeXml($folderId) . '"/>';
+        $xml .= '<t:ItemClass>IPM.Note</t:ItemClass>';
+
+        if ($mime !== null && $mime !== '') {
+            $xml .= '<t:MimeContent CharacterSet="UTF-8">' . base64_encode($mime) . '</t:MimeContent>';
+        }
 
         $xml .= '<t:Subject>' . EwsSoap::escapeXml($email['subject'] ?? '') . '</t:Subject>';
 
@@ -85,11 +126,48 @@ class EwsConverter {
         $xml .= '<t:IsFromMe>' . (isset($kw['$submitted']) ? 'true' : 'false') . '</t:IsFromMe>';
         $xml .= '<t:HasAttachments>' . (!empty($email['attachments']) ? 'true' : 'false') . '</t:HasAttachments>';
 
-        if (!empty($email['conversationId'])) {
-            $xml .= '<t:ConversationIndex>' . base64_encode($email['conversationId']) . '</t:ConversationIndex>';
+        $mid = $email['messageId'] ?? null;
+        if (is_array($mid)) {
+            $mid = $mid[0] ?? null;
         }
-        if (!empty($email['references'])) {
-            $xml .= '<t:InternetMessageId>' . EwsSoap::escapeXml($email['references']) . '</t:InternetMessageId>';
+        if (!is_string($mid) || $mid === '') {
+            $mid = $email['references'] ?? null;
+            if (is_array($mid)) {
+                $mid = $mid[0] ?? null;
+            }
+        }
+        if (is_string($mid) && $mid !== '') {
+            $xml .= '<t:InternetMessageId>' . EwsSoap::escapeXml($mid) . '</t:InternetMessageId>';
+        }
+
+        $convIdx = $email['conversationId'] ?? null;
+        if (is_string($convIdx) && $convIdx !== '') {
+            $xml .= '<t:ConversationIndex>' . base64_encode($convIdx) . '</t:ConversationIndex>';
+        } elseif ($id !== '') {
+            $xml .= '<t:ConversationIndex>' . base64_encode('01' . $id) . '</t:ConversationIndex>';
+        }
+
+        $topic = $email['conversationTopic'] ?? ($email['subject'] ?? '');
+        if ($topic !== '') {
+            $xml .= '<t:ConversationTopic>' . EwsSoap::escapeXml($topic) . '</t:ConversationTopic>';
+        }
+        if (!empty($email['inReplyTo'])) {
+            $irt = is_array($email['inReplyTo']) ? ($email['inReplyTo'][0] ?? '') : $email['inReplyTo'];
+            if ($irt !== '') {
+                $xml .= '<t:InReplyTo>' . EwsSoap::escapeXml(is_array($irt) ? ($irt[0] ?? '') : $irt) . '</t:InReplyTo>';
+            }
+        }
+
+        $refs = $email['references'] ?? null;
+        if (is_array($refs)) {
+            $refVals = [];
+            foreach ($refs as $r) {
+                if (is_string($r) && $r !== '') $refVals[] = $r;
+            }
+            $refs = implode(' ', $refVals);
+        }
+        if (is_string($refs) && $refs !== '') {
+            $xml .= '<t:References>' . EwsSoap::escapeXml($refs) . '</t:References>';
         }
 
         $xml .= '<t:Size>' . ($email['size'] ?? 0) . '</t:Size>';
@@ -97,11 +175,13 @@ class EwsConverter {
 
         $xml .= self::bodyToXml($email, $bodyValues);
 
+        $xml .= '<t:Attachments>';
         if (!empty($email['attachments'])) {
             foreach ($email['attachments'] as $att) {
                 $xml .= self::attachmentToXml($dom, $att, $id);
             }
         }
+        $xml .= '</t:Attachments>';
 
         $xml .= '</t:Message>';
         return $xml;
@@ -115,158 +195,147 @@ class EwsConverter {
         return $xml;
     }
 
-    public static function contactToXml(DOMDocument $dom, array $card, string $folderId, array $bodyValues = []): string {
+    public static function contactToXml(DOMDocument $dom, array $card, ?string $folderId, array $bodyValues = []): string {
         $id        = $card['id'] ?? '';
-        $changeKey = JmapContactConverter::cardModHash($card);
+        $changeKey = self::itemChangeKey($card);
         $name      = $card['name'] ?? [];
 
         $xml = '<t:Contact>';
-        $xml .= EwsSoap::buildId($dom, $id, $changeKey);
-        $xml .= '<t:ParentFolderId Id="' . EwsSoap::escapeXml($folderId) . '"/>';
-
-        $given       = $name['given']      ?? '';
-        $surname     = $name['surname']    ?? '';
-        $full        = $name['full']       ?? '';
-        $displayName = $full ?: trim($given . ' ' . $surname) ?: '';
-
-        $xml .= '<t:DisplayName>' . EwsSoap::escapeXml($displayName) . '</t:DisplayName>';
-        $xml .= '<t:GivenName>' . EwsSoap::escapeXml($given) . '</t:GivenName>';
-        $xml .= '<t:Surname>' . EwsSoap::escapeXml($surname) . '</t:Surname>';
-        if (!empty($name['additional'])) {
-            $xml .= '<t:MiddleName>' . EwsSoap::escapeXml($name['additional']) . '</t:MiddleName>';
+        $xml .= EwsSoap::buildId($dom, self::PFX_CONTACTS . $id, $changeKey);
+        if ($folderId !== null) {
+            $xml .= '<t:ParentFolderId Id="' . EwsSoap::escapeXml($folderId) . '"/>';
         }
-        if (!empty($name['prefix'])) {
-            $xml .= '<t:Title>' . EwsSoap::escapeXml($name['prefix']) . '</t:Title>';
-        }
-        if (!empty($name['suffix'])) {
-            $xml .= '<t:Suffix>' . EwsSoap::escapeXml($name['suffix']) . '</t:Suffix>';
-        }
-        $xml .= '<t:FileAs>' . EwsSoap::escapeXml($full ?: $displayName) . '</t:FileAs>';
-
-        if (!empty($card['nicknames'])) {
-            $nicks = array_values($card['nicknames']);
-            $xml .= '<t:Nickname>' . EwsSoap::escapeXml($nicks[0]['name'] ?? '') . '</t:Nickname>';
-        }
-
-        $emails = array_values($card['emails'] ?? []);
-        foreach ($emails as $i => $e) {
-            $key = match($i) { 0 => 'Email1', 1 => 'Email2', 2 => 'Email3', default => null };
-            if ($key) {
-                $xml .= '<t:' . $key . '><t:Entry Key="'. $key . '">' . EwsSoap::escapeXml($e['address'] ?? '') . '</t:Entry></t:' . $key . '>';
-                $xml .= '<t:' . $key . 'Address>' . EwsSoap::escapeXml($e['address'] ?? '') . '</t:' . $key . 'Address>';
-            }
-        }
-
-        foreach (array_values($card['phones'] ?? []) as $p) {
-            $num    = $p['number'] ?? '';
-            $ctx    = $p['contexts'] ?? [];
-            $feat   = $p['features'] ?? [];
-            $phoneKey = 'PhoneNumber';
-            if (isset($feat['cell']) || isset($feat['mobile'])) {
-                $phoneKey = 'MobilePhone';
-            } elseif (isset($feat['fax'])) {
-                $phoneKey = isset($ctx['work']) ? 'BusinessFax' : 'HomeFax';
-            } elseif (isset($ctx['work'])) {
-                $phoneKey = 'BusinessPhone';
-            } elseif (isset($ctx['home'])) {
-                $phoneKey = 'HomePhone';
-            }
-            $xml .= '<t:' . $phoneKey . '>' . EwsSoap::escapeXml($num) . '</t:' . $phoneKey . '>';
-        }
-
-        foreach (array_values($card['addresses'] ?? []) as $addr) {
-            $ctx     = $addr['contexts'] ?? [];
-            $parsed  = self::parseAddressComponents($addr['components'] ?? []);
-            $addrKey = isset($ctx['work']) ? 'Business' : (isset($ctx['home']) ? 'Home' : 'Other');
-            $xml .= '<t:' . $addrKey . 'Street>' . EwsSoap::escapeXml($parsed['street']) . '</t:' . $addrKey . 'Street>';
-            $xml .= '<t:' . $addrKey . 'City>' . EwsSoap::escapeXml($parsed['city']) . '</t:' . $addrKey . 'City>';
-            $xml .= '<t:' . $addrKey . 'State>' . EwsSoap::escapeXml($parsed['state']) . '</t:' . $addrKey . 'State>';
-            $xml .= '<t:' . $addrKey . 'PostalCode>' . EwsSoap::escapeXml($parsed['postal']) . '</t:' . $addrKey . 'PostalCode>';
-            $xml .= '<t:' . $addrKey . 'Country>' . EwsSoap::escapeXml($parsed['country']) . '</t:' . $addrKey . 'Country>';
-        }
-
-        $orgs = array_values($card['organizations'] ?? []);
-        if ($orgs) {
-            $xml .= '<t:CompanyName>' . EwsSoap::escapeXml($orgs[0]['name'] ?? '') . '</t:CompanyName>';
-        }
-        $titles = array_values($card['jobTitles'] ?? []);
-        if ($titles) {
-            $xml .= '<t:JobTitle>' . EwsSoap::escapeXml($titles[0]['name'] ?? '') . '</t:JobTitle>';
-        }
-        $depts = array_values($card['departments'] ?? []);
-        if ($depts) {
-            $xml .= '<t:Department>' . EwsSoap::escapeXml($depts[0]['name'] ?? '') . '</t:Department>';
-        }
-
-        $ims = array_values($card['onlineServices'] ?? []);
-        if ($ims) {
-            $xml .= '<t:IMAddress>' . EwsSoap::escapeXml($ims[0]['uri'] ?? $ims[0]['service'] ?? '') . '</t:IMAddress>';
-        }
-
-        $links = array_values($card['links'] ?? []);
-        if ($links) {
-            $xml .= '<t:BusinessHomePage>' . EwsSoap::escapeXml($links[0]['uri'] ?? '') . '</t:BusinessHomePage>';
-        }
-
-        foreach ($card['anniversaries'] ?? [] as $ann) {
-            $date = $ann['date'] ?? [];
-            $dateStr = '';
-            if (is_array($date)) {
-                $y = $date['year'] ?? 0;
-                $m = $date['month'] ?? 1;
-                $d = $date['day'] ?? 1;
-                $dateStr = sprintf('%04d-%02d-%02dT00:00:00Z', $y, $m, $d);
-            } elseif (is_string($date)) {
-                $dateStr = $date;
-            }
-            if ($dateStr) {
-                if (str_contains(strtolower($ann['type'] ?? 'birth'), 'birth')) {
-                    $xml .= '<t:Birthday>' . $dateStr . '</t:Birthday>';
-                } else {
-                    $xml .= '<t:WeddingAnniversary>' . $dateStr . '</t:WeddingAnniversary>';
-                }
-            }
-        }
-
+        $xml .= '<t:ItemClass>IPM.Contact</t:ItemClass>';
+        // ItemType properties precede ContactItemType properties in types.xsd.
         $notes = array_values($card['notes'] ?? []);
-        if ($notes && !empty($notes[0]['note'])) {
+        if (isset($notes[0]['note']) && is_string($notes[0]['note'])) {
             $xml .= '<t:Body BodyType="Text">' . EwsSoap::escapeXml($notes[0]['note']) . '</t:Body>';
         }
-
         $cats = array_keys($card['categories'] ?? []);
         if ($cats) {
             $xml .= '<t:Categories>';
-            foreach ($cats as $cat) {
-                $xml .= '<t:String>' . EwsSoap::escapeXml($cat) . '</t:String>';
-            }
+            foreach ($cats as $cat) $xml .= '<t:String>' . EwsSoap::escapeXml((string)$cat) . '</t:String>';
             $xml .= '</t:Categories>';
         }
 
-        $photoUri = '';
-        foreach (['media', 'photos'] as $key) {
-            if (!empty($card[$key])) {
-                $entry = reset($card[$key]);
-                if (!empty($entry['uri'])) {
-                    $photoUri = $entry['uri'];
-                    break;
-                }
+        $parts       = self::contactNameParts($name);
+        $given       = $parts['given'];
+        $surname     = $parts['surname'];
+        $full        = $name['full'] ?? '';
+        $displayName = $full !== '' ? $full : ($parts['orderedFull'] !== '' ? $parts['orderedFull'] : trim($given . ' ' . $surname));
+
+        if ($displayName !== '') $xml .= '<t:FileAs>' . EwsSoap::escapeXml($full !== '' ? $full : $displayName) . '</t:FileAs>';
+        if ($displayName !== '') $xml .= '<t:DisplayName>' . EwsSoap::escapeXml($displayName) . '</t:DisplayName>';
+        if ($given !== '') $xml .= '<t:GivenName>' . EwsSoap::escapeXml($given) . '</t:GivenName>';
+        if ($parts['additional'] !== '') {
+            $xml .= '<t:MiddleName>' . EwsSoap::escapeXml($parts['additional']) . '</t:MiddleName>';
+        }
+        if (!empty($card['nicknames'])) {
+            $nicks = array_values($card['nicknames']);
+            if (!empty($nicks[0]['name'])) $xml .= '<t:Nickname>' . EwsSoap::escapeXml($nicks[0]['name']) . '</t:Nickname>';
+        }
+        if ($parts['prefix'] !== '' || $parts['suffix'] !== '') {
+            $xml .= '<t:CompleteName>';
+            if ($parts['prefix'] !== '') $xml .= '<t:Title>' . EwsSoap::escapeXml($parts['prefix']) . '</t:Title>';
+            if ($parts['suffix'] !== '') $xml .= '<t:Suffix>' . EwsSoap::escapeXml($parts['suffix']) . '</t:Suffix>';
+            $xml .= '</t:CompleteName>';
+        }
+        $orgs = array_values($card['organizations'] ?? []);
+        if ($orgs && !empty($orgs[0]['name'])) {
+            $xml .= '<t:CompanyName>' . EwsSoap::escapeXml($orgs[0]['name']) . '</t:CompanyName>';
+        }
+
+        $emails = array_values($card['emails'] ?? []);
+        usort($emails, fn($a, $b) => (int)(($b['contexts']['work'] ?? false) === true) - (int)(($a['contexts']['work'] ?? false) === true));
+        $emailEntries = '';
+        $emailIndex = 1;
+        foreach ($emails as $email) {
+            $address = $email['address'] ?? null;
+            if (!is_string($address) || $address === '') continue;
+            if ($emailIndex > 3) break;
+            $emailEntries .= '<t:Entry Key="EmailAddress' . $emailIndex++ . '">' . EwsSoap::escapeXml($address) . '</t:Entry>';
+        }
+        if ($emailEntries !== '') $xml .= '<t:EmailAddresses>' . $emailEntries . '</t:EmailAddresses>';
+
+        $addresses = [];
+        foreach (array_values($card['addresses'] ?? []) as $addr) {
+            $ctx = $addr['contexts'] ?? [];
+            $key = ($ctx['work'] ?? false) === true ? 'Business' : ((($ctx['home'] ?? false) === true || ($ctx['private'] ?? false) === true) ? 'Home' : 'Other');
+            if (isset($addresses[$key])) continue;
+            $parsed = self::parseAddressComponents($addr['components'] ?? []);
+            $entry = '';
+            foreach (['street' => 'Street', 'city' => 'City', 'state' => 'State', 'country' => 'CountryOrRegion', 'postal' => 'PostalCode'] as $part => $element) {
+                if ($parsed[$part] !== '') $entry .= '<t:' . $element . '>' . EwsSoap::escapeXml($parsed[$part]) . '</t:' . $element . '>';
+            }
+            if ($entry !== '') $addresses[$key] = '<t:Entry Key="' . $key . '">' . $entry . '</t:Entry>';
+        }
+        if ($addresses) $xml .= '<t:PhysicalAddresses>' . implode('', $addresses) . '</t:PhysicalAddresses>';
+
+        $phones = [];
+        foreach (array_values($card['phones'] ?? []) as $p) {
+            $num    = $p['number'] ?? null;
+            if (!is_string($num) || $num === '') continue;
+            $ctx    = $p['contexts'] ?? [];
+            $feat   = $p['features'] ?? [];
+            $work = ($ctx['work'] ?? false) === true;
+            $home = ($ctx['home'] ?? false) === true || ($ctx['private'] ?? false) === true;
+            if (($feat['cell'] ?? false) === true || ($feat['mobile'] ?? false) === true) $keys = ['MobilePhone'];
+            elseif (($feat['fax'] ?? false) === true) $keys = [$work ? 'BusinessFax' : ($home ? 'HomeFax' : 'OtherFax')];
+            elseif (($feat['pager'] ?? false) === true) $keys = ['Pager'];
+            elseif ($work) $keys = ['BusinessPhone', 'BusinessPhone2'];
+            elseif ($home) $keys = ['HomePhone', 'HomePhone2'];
+            else $keys = ['OtherTelephone'];
+            foreach ($keys as $key) {
+                if (!isset($phones[$key])) { $phones[$key] = $num; break; }
             }
         }
-        if ($photoUri) {
-            $commaPos = strpos($photoUri, ',');
-            if ($commaPos !== false) {
-                $rawBase64 = substr($photoUri, $commaPos + 1);
-                $xml .= '<t:ContactPhoto>' . EwsSoap::escapeXml($rawBase64) . '</t:ContactPhoto>';
+        if ($phones) {
+            $xml .= '<t:PhoneNumbers>';
+            foreach ($phones as $key => $num) $xml .= '<t:Entry Key="' . $key . '">' . EwsSoap::escapeXml($num) . '</t:Entry>';
+            $xml .= '</t:PhoneNumbers>';
+        }
+        $dates = [];
+        foreach ($card['anniversaries'] ?? [] as $ann) {
+            $type = $ann['kind'] ?? $ann['type'] ?? '';
+            $key = $type === 'birth' ? 'Birthday' : ($type === 'wedding' ? 'WeddingAnniversary' : null);
+            $date = $ann['date'] ?? null;
+            if ($key === null || isset($dates[$key])) continue;
+            if (is_array($date) && is_int($date['year'] ?? null) && is_int($date['month'] ?? null) && is_int($date['day'] ?? null)) {
+                $date = sprintf('%04d-%02d-%02d', $date['year'], $date['month'], $date['day']);
+            }
+            if (is_string($date) && preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $date, $m) && (int)$m[1] > 0 && checkdate((int)$m[2], (int)$m[3], (int)$m[1])) $dates[$key] = $date . 'T00:00:00Z';
+        }
+        if (isset($dates['Birthday'])) $xml .= '<t:Birthday>' . $dates['Birthday'] . '</t:Birthday>';
+        $links = array_values($card['links'] ?? []);
+        foreach ($links as $link) {
+            if (($link['contexts']['work'] ?? false) === true && !empty($link['uri'])) {
+                $xml .= '<t:BusinessHomePage>' . EwsSoap::escapeXml($link['uri']) . '</t:BusinessHomePage>';
+                break;
             }
         }
+        $depts = array_values($card['departments'] ?? []);
+        if ($depts && !empty($depts[0]['name'])) $xml .= '<t:Department>' . EwsSoap::escapeXml($depts[0]['name']) . '</t:Department>';
+        $imEntries = '';
+        $imIndex = 1;
+        foreach (array_values($card['onlineServices'] ?? []) as $im) {
+            $uri = $im['uri'] ?? null;
+            if (!is_string($uri) || !preg_match('/^(?:im|xmpp|sip|sips|matrix):/i', $uri)) continue;
+            if ($imIndex > 3) break;
+            $imEntries .= '<t:Entry Key="ImAddress' . $imIndex++ . '">' . EwsSoap::escapeXml($uri) . '</t:Entry>';
+        }
+        if ($imEntries !== '') $xml .= '<t:ImAddresses>' . $imEntries . '</t:ImAddresses>';
+        $titles = array_values($card['jobTitles'] ?? $card['titles'] ?? []);
+        if ($titles && !empty($titles[0]['name'])) $xml .= '<t:JobTitle>' . EwsSoap::escapeXml($titles[0]['name']) . '</t:JobTitle>';
+        if ($surname !== '') $xml .= '<t:Surname>' . EwsSoap::escapeXml($surname) . '</t:Surname>';
+        if (isset($dates['WeddingAnniversary'])) $xml .= '<t:WeddingAnniversary>' . $dates['WeddingAnniversary'] . '</t:WeddingAnniversary>';
 
         $xml .= '</t:Contact>';
         return $xml;
     }
 
-    public static function calendarToXml(DOMDocument $dom, array $event, string $folderId): string {
+    public static function calendarToXml(DOMDocument $dom, array $event, ?string $folderId): string {
         $id        = $event['id'] ?? '';
-        $changeKey = JmapCalendarConverter::eventModHash($event);
+        $changeKey = self::itemChangeKey($event);
 
         $startRaw  = $event['start'] ?? '';
         $startTs   = JmapCalendarConverter::jmapTimeToTimestamp($startRaw);
@@ -275,8 +344,10 @@ class EwsConverter {
         $allDay    = !empty($event['showWithoutTime']);
 
         $xml = '<t:CalendarItem>';
-        $xml .= EwsSoap::buildId($dom, $id, $changeKey);
-        $xml .= '<t:ParentFolderId Id="' . EwsSoap::escapeXml($folderId) . '"/>';
+        $xml .= EwsSoap::buildId($dom, self::PFX_CALENDAR . $id, $changeKey);
+        if ($folderId !== null) {
+            $xml .= '<t:ParentFolderId Id="' . EwsSoap::escapeXml($folderId) . '"/>';
+        }
 
         $xml .= '<t:Subject>' . EwsSoap::escapeXml($event['title'] ?? '(No Subject)') . '</t:Subject>';
         $xml .= '<t:Start>' . gmdate('Y-m-d\TH:i:s\Z', $startTs) . '</t:Start>';
@@ -342,6 +413,50 @@ class EwsConverter {
         return $xml;
     }
 
+    private static function contactNameParts(array $name): array {
+        // RFC 9553 kinds, plus legacy kinds used by older Stalwart cards.
+        $kindMap = [
+            'given' => 'given', 'surname' => 'surname', 'surname2' => 'surname',
+            'given2' => 'additional', 'additional' => 'additional',
+            'title' => 'prefix', 'prefix' => 'prefix',
+            'credential' => 'suffix', 'generation' => 'suffix', 'suffix' => 'suffix',
+        ];
+        $parts = ['given' => '', 'surname' => '', 'additional' => '', 'prefix' => '', 'suffix' => '', 'orderedFull' => ''];
+        $lastGroup = null;
+        $separator = null;
+        $hasFullPart = false;
+        $ordered = ($name['isOrdered'] ?? false) === true;
+        $defaultSeparator = $ordered && is_string($name['defaultSeparator'] ?? null) ? $name['defaultSeparator'] : ' ';
+        foreach (($name['components'] ?? []) as $component) {
+            if (!is_array($component) || !is_string($component['value'] ?? null)) continue;
+            $kind = $component['kind'] ?? '';
+            $value = $component['value'];
+            if ($kind === 'separator') {
+                if ($ordered) $separator = ($separator ?? '') . $value;
+                continue;
+            }
+            if ($value === '') continue;
+            if ($ordered) {
+                if ($hasFullPart) $parts['orderedFull'] .= $separator ?? $defaultSeparator;
+                $parts['orderedFull'] .= $value;
+                $hasFullPart = true;
+            }
+            $group = is_string($kind) ? ($kindMap[$kind] ?? null) : null;
+            if ($group !== null) {
+                if ($parts[$group] !== '') {
+                    $parts[$group] .= $group === $lastGroup ? ($separator ?? $defaultSeparator) : ' ';
+                }
+                $parts[$group] .= $value;
+            }
+            $lastGroup = $group;
+            $separator = null;
+        }
+        foreach (['given', 'surname', 'additional', 'prefix', 'suffix'] as $key) {
+            if ($parts[$key] === '' && is_string($name[$key] ?? null)) $parts[$key] = $name[$key];
+        }
+        return $parts;
+    }
+
     public static function ewsContactToCard(DOMElement $contactEl, string $addressBookId): array {
         $card = [
             '@type'          => 'Card',
@@ -356,25 +471,21 @@ class EwsConverter {
         $company = self::getXmlChildValue($contactEl, 't:CompanyName');
         $jobTitle = self::getXmlChildValue($contactEl, 't:JobTitle');
 
-        $components = [];
-        if ($given)   $components[] = ['kind' => 'given',    'value' => $given];
-        if ($surname) $components[] = ['kind' => 'surname',  'value' => $surname];
-
         $middle = self::getXmlChildValue($contactEl, 't:MiddleName');
-        if ($middle)  $components[] = ['kind' => 'additional', 'value' => $middle];
-
-        $prefix = self::getXmlChildValue($contactEl, 't:Title');
-        if ($prefix)  $components[] = ['kind' => 'prefix', 'value' => $prefix];
-
-        $suffix = self::getXmlChildValue($contactEl, 't:Suffix');
-        if ($suffix)  $components[] = ['kind' => 'suffix', 'value' => $suffix];
-
-        if ($components) {
-            $card['name'] = ['components' => $components, 'isOrdered' => true];
-            if ($given)   $card['name']['given']    = $given;
-            if ($surname) $card['name']['surname']  = $surname;
-            $full = $given || $surname ? trim($given . ' ' . $surname) : null;
-            if ($full)    $card['name']['full']     = $full;
+        $prefix = self::getXmlChildValue($contactEl, 't:CompleteName/t:Title') ?: self::getXmlChildValue($contactEl, 't:Title');
+        $suffix = self::getXmlChildValue($contactEl, 't:CompleteName/t:Suffix') ?: self::getXmlChildValue($contactEl, 't:Suffix');
+        $displayName = self::getXmlChildValue($contactEl, 't:DisplayName');
+        $components = [];
+        foreach (['title' => $prefix, 'given' => $given, 'given2' => $middle, 'surname' => $surname, 'credential' => $suffix] as $kind => $value) {
+            if ($value !== '') $components[] = ['kind' => $kind, 'value' => $value];
+        }
+        if ($components || $displayName !== '') {
+            $card['name'] = [];
+            if ($components) {
+                $card['name']['components'] = $components;
+                $card['name']['isOrdered'] = true;
+            }
+            if ($displayName !== '') $card['name']['full'] = $displayName;
         }
 
         if ($company)  $card['organizations'] = ['o1' => ['name' => $company]];
@@ -384,15 +495,12 @@ class EwsConverter {
         if ($dept)     $card['departments']   = ['d1' => ['name' => $dept]];
 
         $emails = [];
+        $emailNodes = self::contactDictionaryEntries($contactEl, 'EmailAddresses');
         foreach (['Email1', 'Email2', 'Email3'] as $i => $key) {
-            $val = self::getXmlChildValue($contactEl, "t:{$key}Address") ?: self::getXmlChildValue($contactEl, "t:{$key}");
-            if ($val) {
-                $ctx = match($i) {
-                    0 => ['work' => true],
-                    1 => ['home' => true],
-                    default => [],
-                };
-                $emails['e' . ($i+1)] = ['address' => $val, 'contexts' => $ctx];
+            $node = $emailNodes['EmailAddress' . ($i + 1)] ?? null;
+            $val = $node ? trim($node->textContent) : (self::getXmlChildValue($contactEl, "t:{$key}Address") ?: self::getXmlChildValue($contactEl, "t:{$key}"));
+            if ($val !== '') {
+                $emails['e' . ($i+1)] = ['address' => $val];
             }
         }
         if ($emails) $card['emails'] = $emails;
@@ -400,16 +508,17 @@ class EwsConverter {
         $phones = [];
         $pi = 1;
         $phoneFields = [
-            't:BusinessPhone'   => [['work' => true], []],
-            't:HomePhone'       => [['home' => true], []],
-            't:MobilePhone'     => [[], ['cell' => true]],
-            't:BusinessFax'     => [['work' => true], ['fax' => true]],
-            't:HomeFax'         => [['home' => true], ['fax' => true]],
-            't:Pager'           => [[], ['pager' => true]],
+            'BusinessPhone' => [['work' => true], []], 'BusinessPhone2' => [['work' => true], []],
+            'HomePhone' => [['home' => true], []], 'HomePhone2' => [['home' => true], []],
+            'MobilePhone' => [[], ['cell' => true]], 'BusinessFax' => [['work' => true], ['fax' => true]],
+            'HomeFax' => [['home' => true], ['fax' => true]], 'OtherFax' => [[], ['fax' => true]],
+            'OtherTelephone' => [[], []], 'Pager' => [[], ['pager' => true]],
         ];
+        $phoneNodes = self::contactDictionaryEntries($contactEl, 'PhoneNumbers');
         foreach ($phoneFields as $xmlField => [$ctx, $feat]) {
-            $val = self::getXmlChildValue($contactEl, $xmlField);
-            if ($val) {
+            $node = $phoneNodes[$xmlField] ?? null;
+            $val = $node ? trim($node->textContent) : self::getXmlChildValue($contactEl, 't:' . $xmlField);
+            if ($val !== '') {
                 $entry = ['number' => $val];
                 if ($ctx)  $entry['contexts'] = $ctx;
                 if ($feat) $entry['features'] = $feat;
@@ -419,27 +528,36 @@ class EwsConverter {
         if ($phones) $card['phones'] = $phones;
 
         $addrs = [];
+        $addressNodes = self::contactDictionaryEntries($contactEl, 'PhysicalAddresses');
         foreach (['Business' => 'work', 'Home' => 'home', 'Other' => 'other'] as $prefix => $context) {
-            $street = self::getXmlChildValue($contactEl, "t:{$prefix}Street");
-            $city   = self::getXmlChildValue($contactEl, "t:{$prefix}City");
-            $state  = self::getXmlChildValue($contactEl, "t:{$prefix}State");
-            $postal = self::getXmlChildValue($contactEl, "t:{$prefix}PostalCode");
-            $country= self::getXmlChildValue($contactEl, "t:{$prefix}Country");
-            if ($street || $city) {
+            $node = $addressNodes[$prefix] ?? null;
+            $street = $node ? self::getXmlChildValue($node, 't:Street') : self::getXmlChildValue($contactEl, "t:{$prefix}Street");
+            $city   = $node ? self::getXmlChildValue($node, 't:City') : self::getXmlChildValue($contactEl, "t:{$prefix}City");
+            $state  = $node ? self::getXmlChildValue($node, 't:State') : self::getXmlChildValue($contactEl, "t:{$prefix}State");
+            $postal = $node ? self::getXmlChildValue($node, 't:PostalCode') : self::getXmlChildValue($contactEl, "t:{$prefix}PostalCode");
+            $country= $node ? self::getXmlChildValue($node, 't:CountryOrRegion') : self::getXmlChildValue($contactEl, "t:{$prefix}Country");
+            if ($street !== '' || $city !== '' || $state !== '' || $postal !== '' || $country !== '') {
                 $components = [];
-                if ($street) $components[] = ['kind' => 'street', 'value' => $street];
-                if ($city)   $components[] = ['kind' => 'locality', 'value' => $city];
-                if ($state)  $components[] = ['kind' => 'region', 'value' => $state];
-                if ($postal) $components[] = ['kind' => 'postcode', 'value' => $postal];
-                if ($country)$components[] = ['kind' => 'country', 'value' => $country];
-                $addr = ['@type' => 'Address', 'components' => $components, 'contexts' => [$context => true]];
+                if ($street !== '') $components[] = ['kind' => 'street', 'value' => $street];
+                if ($city !== '')   $components[] = ['kind' => 'locality', 'value' => $city];
+                if ($state !== '')  $components[] = ['kind' => 'region', 'value' => $state];
+                if ($postal !== '') $components[] = ['kind' => 'postcode', 'value' => $postal];
+                if ($country !== '')$components[] = ['kind' => 'country', 'value' => $country];
+                $addr = ['@type' => 'Address', 'components' => $components];
+                if ($context !== 'other') $addr['contexts'] = [$context => true];
                 $addrs['a' . $pi++] = $addr;
             }
         }
         if ($addrs) $card['addresses'] = $addrs;
 
-        $im = self::getXmlChildValue($contactEl, 't:IMAddress');
-        if ($im) $card['onlineServices'] = ['im1' => ['uri' => $im]];
+        $imNodes = self::contactDictionaryEntries($contactEl, 'ImAddresses');
+        $ims = [];
+        foreach (range(1, 3) as $i) {
+            $node = $imNodes['ImAddress' . $i] ?? null;
+            $im = $node ? trim($node->textContent) : ($i === 1 ? self::getXmlChildValue($contactEl, 't:IMAddress') : '');
+            if ($im !== '') $ims['im' . $i] = preg_match('/^[A-Za-z][A-Za-z0-9+.-]*:/', $im) ? ['uri' => $im] : ['user' => $im];
+        }
+        if ($ims) $card['onlineServices'] = $ims;
 
         $url = self::getXmlChildValue($contactEl, 't:BusinessHomePage');
         if ($url) $card['links'] = ['l1' => ['@type' => 'Link', 'uri' => $url]];
@@ -455,6 +573,18 @@ class EwsConverter {
         }
 
         return $card;
+    }
+
+    private static function contactDictionaryEntries(DOMElement $contact, string $dictionary): array {
+        $entries = [];
+        $container = EwsSoap::getFirstChild($contact, $dictionary, EwsSoap::NS_T);
+        if ($container) foreach ($container->childNodes as $entry) {
+            if ($entry instanceof DOMElement && $entry->namespaceURI === EwsSoap::NS_T && $entry->localName === 'Entry') {
+                $key = $entry->getAttribute('Key');
+                if ($key !== '' && !isset($entries[$key])) $entries[$key] = $entry;
+            }
+        }
+        return $entries;
     }
 
     public static function ewsEventToJmap(DOMElement $eventEl, string $calendarId): array {
@@ -530,33 +660,32 @@ class EwsConverter {
         return $event;
     }
 
+    private static function bodyValue(array $bodyValues, ?string $partId): ?string {
+        if ($partId === null) return null;
+        if (is_string($bodyValues[$partId]['value'] ?? null)) {
+            return $bodyValues[$partId]['value'];
+        }
+        foreach ($bodyValues as $bv) {
+            if (is_array($bv) && ($bv['partId'] ?? null) === $partId && is_string($bv['value'] ?? null)) {
+                return $bv['value'];
+            }
+        }
+        return null;
+    }
+
     public static function bodyToXml(array $email, array $bodyValues = []): string {
-        $xml = '';
-
-        if (!empty($email['htmlBody'])) {
-            $partId = $email['htmlBody'][0]['partId'] ?? null;
-            if ($partId && isset($bodyValues[$partId]['value'])) {
-                $xml .= '<t:Body BodyType="HTML">' . EwsSoap::escapeXml($bodyValues[$partId]['value']) . '</t:Body>';
-                return $xml;
+        if (is_array($email['bodyValues'] ?? null)) $bodyValues += $email['bodyValues'];
+        foreach (['htmlBody' => 'HTML', 'textBody' => 'Text'] as $property => $type) {
+            $part = $email[$property][0] ?? null;
+            if (!is_array($part)) continue;
+            $partId = is_string($part['partId'] ?? null) ? $part['partId'] : null;
+            $value = self::bodyValue($bodyValues, $partId);
+            if ($value === null && is_string($part['value'] ?? null)) $value = $part['value'];
+            if ($value !== null) {
+                return '<t:Body BodyType="' . $type . '">' . EwsSoap::escapeXml($value) . '</t:Body>';
             }
         }
-
-        if (!empty($email['textBody'])) {
-            $partId = $email['textBody'][0]['partId'] ?? null;
-            if ($partId && isset($bodyValues[$partId]['value'])) {
-                $xml .= '<t:Body BodyType="Text">' . EwsSoap::escapeXml($bodyValues[$partId]['value']) . '</t:Body>';
-                return $xml;
-            }
-        }
-
-        if (!empty($email['textBody'])) {
-            $partId = $email['textBody'][0]['partId'] ?? null;
-            if ($partId) {
-                $xml .= '<t:Body BodyType="Text">' . EwsSoap::escapeXml($email['textBody'][0]['value'] ?? '') . '</t:Body>';
-            }
-        }
-
-        return $xml;
+        return '';
     }
 
     public static function attachmentToXml(DOMDocument $dom, array $att, string $emailId): string {
@@ -577,10 +706,7 @@ class EwsConverter {
     }
 
     public static function modHash(array $item): string {
-        $key = ($item['subject'] ?? '') .
-               ($item['receivedAt'] ?? '') .
-               implode('', array_keys($item['keywords'] ?? []));
-        return sprintf('%08x', crc32($key));
+        return self::itemChangeKey($item);
     }
 
     private static function firstAddress(array $addrs): ?array {

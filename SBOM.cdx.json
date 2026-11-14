@@ -1,0 +1,542 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "bom-ref": "repository",
+      "name": "Stalwart JMAP-EWS Bridge source repository",
+      "description": "Source inventory; project license and exact dependency versions are unknown."
+    }
+  },
+  "components": [
+    {
+      "type": "application",
+      "bom-ref": "bridge",
+      "name": "Standalone EWS bridge",
+      "description": "Repository implementation of the standalone EWS bridge.",
+      "scope": "required"
+    },
+    {
+      "type": "application",
+      "bom-ref": "backend",
+      "name": "Z-Push JMAP backend",
+      "description": "Repository backend for use with an external Z-Push installation.",
+      "scope": "optional"
+    },
+    {
+      "type": "application",
+      "bom-ref": "tests",
+      "name": "Repository tests",
+      "description": "Optional repository tests, including live integration checks.",
+      "scope": "optional"
+    },
+    {
+      "type": "application",
+      "bom-ref": "generator",
+      "name": "SBOM generator",
+      "description": "Repository SBOM generation tool.",
+      "scope": "optional"
+    },
+    {
+      "type": "framework",
+      "bom-ref": "php",
+      "name": "PHP",
+      "description": "PHP runtime; installed version is not established by this source inventory.",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "bom-ref": "php-curl",
+      "name": "PHP cURL extension",
+      "description": "HTTP transport used by the JMAP client.",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "bom-ref": "php-dom-libxml",
+      "name": "PHP DOM and libxml",
+      "description": "XML parsing and generation used by the EWS bridge.",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pdo-sqlite",
+      "name": "PHP PDO SQLite",
+      "description": "PDO SQLite driver used by the sync store.",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "bom-ref": "php-posix",
+      "name": "PHP POSIX extension",
+      "description": "POSIX functions used by the sync store.",
+      "scope": "required"
+    },
+    {
+      "type": "platform",
+      "bom-ref": "php-fsync",
+      "name": "PHP fsync support",
+      "description": "PHP fsync function and a filesystem supporting durable fsync and SQLite WAL locking.",
+      "scope": "required"
+    },
+    {
+      "type": "framework",
+      "bom-ref": "z-push",
+      "name": "Z-Push",
+      "description": "External framework required only when running the Z-Push JMAP backend; not bundled.",
+      "scope": "optional"
+    },
+    {
+      "type": "application",
+      "bom-ref": "nginx",
+      "name": "nginx",
+      "description": "Optional deployment choice; not bundled.",
+      "scope": "optional"
+    },
+    {
+      "type": "application",
+      "bom-ref": "php-fpm",
+      "name": "PHP-FPM",
+      "description": "Optional deployment choice; not bundled.",
+      "scope": "optional"
+    },
+    {
+      "type": "framework",
+      "bom-ref": "python",
+      "name": "Python 3",
+      "description": "Standard-library runtime for the generator and optional live test.",
+      "scope": "optional"
+    },
+    {
+      "type": "library",
+      "bom-ref": "php-pcntl",
+      "name": "PHP PCNTL extension",
+      "description": "Required by fork-based SQLite tests only.",
+      "scope": "optional"
+    },
+    {
+      "type": "application",
+      "bom-ref": "curl-cli",
+      "name": "curl command-line tool",
+      "description": "Required by the optional live integration test.",
+      "scope": "optional"
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/bootstrap.php",
+      "name": "ews/bootstrap.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "27854d5f0d2c07786165e202a30217d430748e9686fca7159a32d886b84fb78c"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/compat.php",
+      "name": "ews/compat.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6fc89c1bfa7687e4d8ec8af1f57258dcd2c3c1509d06d1924fd4b7052347b42f"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/public/index.php",
+      "name": "ews/public/index.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "01b408bb57f91dd0471fdd621f4778242709cacba9a3b4d6910cf9728089fbf4"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/run.php",
+      "name": "ews/run.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ca6b448bb103e5ae11b569d72393c70a34243e05b2a4ef0f662b40d58f5f9353"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/Converter.php",
+      "name": "ews/src/Converter.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3d15fa3c5a41ae83906a2401896cd5c9fa4b5c4280f274361991d4125b7c7863"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/Operations.php",
+      "name": "ews/src/Operations.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7623730ce0cf1c5a68e936f34f88b56dd84bc76c8f82c7a745db2223ea508a4f"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/Server.php",
+      "name": "ews/src/Server.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7541d0570b8db76086e5712a5f65e78a947dee133bdfa0f5055dc627d2aed4b2"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/Soap.php",
+      "name": "ews/src/Soap.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4f8064cdc4eaa0f9123dd292c6dbd59ae33fc834453adc91041c2cf7c4e9a8dc"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/SqliteSyncStore.php",
+      "name": "ews/src/SqliteSyncStore.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f36de52b4301c3d92998ef36916c0c87eb8913a7712a88033aa1c72beef4c454"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/SyncState.php",
+      "name": "ews/src/SyncState.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4a7df7405c93ead424ee469d56d65f61da6955fcbccd7d77500243371f7e8268"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:jmap/jmap.php",
+      "name": "jmap/jmap.php",
+      "description": "Repository source file. Header claims AGPL-3.0; see docs/SBOM.md for limits of this evidence.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4e5bc10e65e5b0733e2c93363504dc8984bd0cd748401a480c75360645c300b3"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:jmap/jmap_calendar.php",
+      "name": "jmap/jmap_calendar.php",
+      "description": "Repository source file. Header claims AGPL-3.0; see docs/SBOM.md for limits of this evidence.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "223d14d25e19d129a905a7f7abf22f47161b239c4cc89ef14f807db2605c6203"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:jmap/jmap_client.php",
+      "name": "jmap/jmap_client.php",
+      "description": "Repository source file. Header claims AGPL-3.0; see docs/SBOM.md for limits of this evidence.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "b67a78006c80cfc33d96ba153b6b7a02e916c96934b2b39417751a64115aff69"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:jmap/jmap_contacts.php",
+      "name": "jmap/jmap_contacts.php",
+      "description": "Repository source file. Header claims AGPL-3.0; see docs/SBOM.md for limits of this evidence.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "88ceaa44d874cd9c77970ef19910e4bf0a2b010dcbd00ea586a3089781132900"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/capability_accounts.php",
+      "name": "tests/capability_accounts.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "eee27855bddc35dfa3e1b7e9166903e84ad7c312f5eadb89434bd33de0bc93bb"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/contact_converter.php",
+      "name": "tests/contact_converter.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6e0b34ef3ad9c523f3296a4e369d2971b32c562eb125f32093a81a2cbdf9f146"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/contact_schema.php",
+      "name": "tests/contact_schema.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "001847ea4b64b4a0b90a12d4d3a151b81f56aba32a231f10f47cc9c8294a6385"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/contact_update.php",
+      "name": "tests/contact_update.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1c1fa18389fcbeb1df5aac805b6ac92d4f2215ab46768cf35cf2f34eed4eed45"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/converter_versions.php",
+      "name": "tests/converter_versions.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "99a922648e6bf343c97f2b05e71872bd284a004c0b1315878d84b2d54378118f"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/getitem_versions.php",
+      "name": "tests/getitem_versions.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c9c34f5a9b067e84fc281f144281567e8bfb2389ac1c06ec0303c174b4bab076"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/live_ews.py",
+      "name": "tests/live_ews.py",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0c5adce8240cf5e2ec05d6e772d494b73ecda37e61cd86adc9d51e76dc963db6"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/sqlite_sync_store.php",
+      "name": "tests/sqlite_sync_store.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f00dae12234b4b3d93f31627f06cf21e005a5fba0f1eebd0161c8d97456332f7"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/sync_active_state.php",
+      "name": "tests/sync_active_state.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9cb1eff277c95dac32205ea0758af177a5b064aa371fdfb447cd7f462dbbba71"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/sync_bootstrap.php",
+      "name": "tests/sync_bootstrap.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "64f312c632d1b1e271948f501d73abeffae0ee362828fe8cd5838c256dcfe42c"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/sync_generation.php",
+      "name": "tests/sync_generation.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "915694eac7f6cba1504cfff8c680652a339fc1bb709aa857fa76961d05a1dfda"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/sync_items.php",
+      "name": "tests/sync_items.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "264a0088a1ec505b1ad6164794ffb5bf988980e8b9826a9036507605d4d86de7"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/sync_sqlite_integration.php",
+      "name": "tests/sync_sqlite_integration.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6c3f9db1bedd40b568e5096bbf738608ed8f27a323ea5527ddd38b2e929179d1"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tools/generate_sbom.py",
+      "name": "tools/generate_sbom.py",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9e7a61422d136fdb8fe994f12ed1242b9d6f8fb62705bf927345a6af3cc85a33"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "backend",
+      "dependsOn": [
+        "file:jmap/jmap.php",
+        "file:jmap/jmap_calendar.php",
+        "file:jmap/jmap_client.php",
+        "file:jmap/jmap_contacts.php",
+        "php",
+        "php-curl",
+        "z-push"
+      ]
+    },
+    {
+      "ref": "bridge",
+      "dependsOn": [
+        "file:ews/bootstrap.php",
+        "file:ews/compat.php",
+        "file:ews/public/index.php",
+        "file:ews/run.php",
+        "file:ews/src/Converter.php",
+        "file:ews/src/Operations.php",
+        "file:ews/src/Server.php",
+        "file:ews/src/Soap.php",
+        "file:ews/src/SqliteSyncStore.php",
+        "file:ews/src/SyncState.php",
+        "file:jmap/jmap_calendar.php",
+        "file:jmap/jmap_client.php",
+        "file:jmap/jmap_contacts.php",
+        "pdo-sqlite",
+        "php",
+        "php-curl",
+        "php-dom-libxml",
+        "php-fsync",
+        "php-posix"
+      ]
+    },
+    {
+      "ref": "generator",
+      "dependsOn": [
+        "file:tools/generate_sbom.py",
+        "python"
+      ]
+    },
+    {
+      "ref": "repository",
+      "dependsOn": [
+        "backend",
+        "bridge",
+        "generator",
+        "nginx",
+        "php-fpm",
+        "tests"
+      ]
+    },
+    {
+      "ref": "tests",
+      "dependsOn": [
+        "bridge",
+        "curl-cli",
+        "file:tests/capability_accounts.php",
+        "file:tests/contact_converter.php",
+        "file:tests/contact_schema.php",
+        "file:tests/contact_update.php",
+        "file:tests/converter_versions.php",
+        "file:tests/getitem_versions.php",
+        "file:tests/live_ews.py",
+        "file:tests/sqlite_sync_store.php",
+        "file:tests/sync_active_state.php",
+        "file:tests/sync_bootstrap.php",
+        "file:tests/sync_generation.php",
+        "file:tests/sync_items.php",
+        "file:tests/sync_sqlite_integration.php",
+        "php-pcntl",
+        "php-posix",
+        "python"
+      ]
+    }
+  ]
+}

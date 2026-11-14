@@ -1,4 +1,6 @@
-﻿<?php
+<?php
+
+require_once __DIR__ . '/SyncState.php';
 
 class EwsOperations {
 
@@ -155,56 +157,73 @@ class EwsOperations {
 
     public function syncFolderItems(DOMElement $request): string {
         try {
-            $syncFolderIdEl = EwsSoap::getFirstChild($request, 'SyncFolderId');
-            $syncFolderId = '';
-            if ($syncFolderIdEl) {
-                $syncFolderId = $this->resolveFolderIdFromEl($syncFolderIdEl);
+            $folder = $this->syncResolveFolder($request);
+            [$folderType, $jmapId, $syncFolderId, $account, $using] = $folder;
+            $seenFields = [];
+            foreach ($request->childNodes as $child) {
+                if ($child instanceof DOMElement && in_array($child->localName, ['ItemShape', 'SyncFolderId', 'SyncState', 'MaxChangesReturned', 'SyncScope', 'Ignore'], true)) {
+                    if ($child->namespaceURI !== EwsSoap::NS_M || isset($seenFields[$child->localName])) {
+                        throw new EwsSyncException('ErrorInvalidParameter', 'Invalid or duplicate sync request field');
+                    }
+                    $seenFields[$child->localName] = true;
+                    if ($child->localName === 'Ignore' || ($child->localName === 'SyncScope' && trim($child->textContent) !== 'NormalItems')) {
+                        throw new EwsSyncException('ErrorInvalidParameter', 'Unsupported sync option');
+                    }
+                }
             }
-            if (!$syncFolderId) {
-                $syncFolderId = $this->resolveFolderIdFromEl($request);
+            $stateEl = EwsSoap::getFirstChild($request, 'SyncState', EwsSoap::NS_M);
+            $token = $stateEl ? trim($stateEl->textContent) : '';
+            if ($stateEl && $token === '') throw new EwsSyncException('ErrorInvalidSyncStateData', 'Empty sync state');
+            $maxEl = EwsSoap::getFirstChild($request, 'MaxChangesReturned', EwsSoap::NS_M);
+            $maxText = $maxEl ? trim($maxEl->textContent) : '';
+            if (!preg_match('/^[1-9][0-9]{0,2}$/D', $maxText) || (int)$maxText > 512) {
+                throw new EwsSyncException('ErrorInvalidParameter', 'Invalid MaxChangesReturned');
             }
-
-            $syncState    = EwsSoap::getChildValue($request, 'SyncState');
-            $maxChanges   = EwsSoap::getChildInt($request, 'MaxChangesReturned', 512);
-
-            if (!defined('EWS_SYNC_PAGE_MAX')) {
-                define('EWS_SYNC_PAGE_MAX', 100);
+            $maxChanges = (int)$maxText;
+            $shape = $this->syncItemShape($request);
+            $session = $this->client->getSession();
+            $principal = $session['username'] ?? null;
+            if (!is_string($principal) || trim($principal) === '') throw new RuntimeException('JMAP session username unavailable');
+            $scope = ['server' => $this->client->getApiUrl(), 'principal' => $principal, 'account' => $account, 'folder' => $syncFolderId];
+            $store = new SqliteSyncStore(EWS_SYNC_STATE_DIR);
+            $options = ['operation' => 'SyncFolderItems'];
+            $source = $token === '' ? null : $token;
+            $isPage = $source !== null && !$store->tokenIsComplete($scope, $source);
+            if (!$isPage) {
+                $round = $store->existingRun($scope, $source, $options, $maxChanges);
+                if ($round === null) {
+                    $base = $source === null ? [] : $store->baseline($scope, $source);
+                    [$hashes, $objects] = $this->syncSnapshot($folderType, $jmapId, $account, $using);
+                    if ($this->syncResolveFolder($request) !== $folder) throw new RuntimeException('Sync folder changed during scan');
+                    $old = []; $records = []; $changes = [];
+                    foreach ($base as $record) $old['i' . base64_encode($record['id'])] = $record;
+                    foreach ($old as $key => $record) if (!isset($hashes[$key])) $changes[] = ['kind' => 'Delete', 'id' => $record['id']];
+                    foreach ($hashes as $key => $hash) {
+                        $object = $objects[$key]; $id = $object['id'];
+                        if (!isset($old[$key])) $changes[] = ['kind' => 'Create', 'id' => $id];
+                        elseif ($old[$key]['changeKey'] !== $hash) $changes[] = ['kind' => 'Update', 'id' => $id];
+                        else $object = $old[$key]['object']; // Keep the same semantic version and avoid transient ordering differences.
+                        $records[] = ['id' => $id, 'changeKey' => $hash, 'object' => $object];
+                    }
+                    $round = $store->advance($scope, $source, $options, $maxChanges, $records, $changes);
+                }
+                $token = $round;
             }
-            $pageMax = (int)EWS_SYNC_PAGE_MAX;
-            $maxChanges = max(1, min($maxChanges, $pageMax));
-
-            if (!$syncFolderId) {
-                return $this->errorResponse('SyncFolderItems', 'ErrorInvalidSyncFolderId', 'Missing SyncFolderId');
-            }
-
-            $folderType = $this->folderType($syncFolderId);
-            $jmapId     = $this->jmapId($syncFolderId);
-
+            $page = $store->page($scope, $token, $options, $maxChanges);
             $dom = new DOMDocument();
-
-            $prevState = $syncState ? json_decode(base64_decode($syncState), true) : null;
-            $prevIds = $prevState['ids'] ?? [];
-            $prevPos = $prevState['pos'] ?? null;
-
-            switch ($folderType) {
-                case 'contacts':
-                    [$changesXml, $currentIds, $hasMore, $nextPos] = $this->syncContacts($dom, $jmapId, $prevIds, $prevPos, $maxChanges);
-                    break;
-                case 'calendar':
-                    [$changesXml, $currentIds, $hasMore, $nextPos] = $this->syncCalendarEvents($dom, $jmapId, $prevIds, $prevPos, $maxChanges);
-                    break;
-                default:
-                    [$changesXml, $currentIds, $hasMore, $nextPos] = $this->syncEmails($dom, $jmapId, $prevIds, $prevPos, $maxChanges);
-                    break;
+            $changesXml = '';
+            foreach ($page['changes'] as $change) {
+                $kind = $change['kind']; $rawId = $change['id'];
+                $prefix = $folderType === 'contacts' ? EwsConverter::PFX_CONTACTS : ($folderType === 'calendar' ? EwsConverter::PFX_CALENDAR : '');
+                if ($kind === 'Delete') {
+                    $xml = EwsSoap::buildId($dom, $prefix . $rawId);
+                } else {
+                    $xml = $this->syncItemXml($dom, $folderType, $syncFolderId, $prefix . $rawId, $change['record'], $shape);
+                }
+                $changesXml .= '<t:' . $kind . '>' . $xml . '</t:' . $kind . '>';
             }
-
-            $newState = ['t' => time(), 'ids' => $currentIds];
-            if ($nextPos !== null) {
-                $newState['pos'] = $nextPos;
-            }
-            $newSyncState = base64_encode(json_encode($newState));
-
-            $includesLast = $hasMore ? 'false' : 'true';
+            $newSyncState = $page['nextToken'];
+            $includesLast = $page['done'] ? 'true' : 'false';
 
             $bodyXml = '<m:SyncFolderItemsResponse>' .
                 '<m:ResponseMessages>' .
@@ -219,9 +238,177 @@ class EwsOperations {
 
             return EwsSoap::buildSoapResponse($bodyXml);
 
+        } catch (EwsSyncException $e) {
+            return $this->errorResponse('SyncFolderItems', $e->ewsCode, $e->getMessage());
+        } catch (SqliteSyncInvalidState $e) {
+            return $this->errorResponse('SyncFolderItems', 'ErrorInvalidSyncStateData', 'Invalid or expired sync state');
         } catch (\Throwable $e) {
-            return $this->errorResponse('SyncFolderItems', 'ErrorInternalServerError', $e->getMessage());
+            error_log('SyncFolderItems failed (' . get_class($e) . ')');
+            return $this->errorResponse('SyncFolderItems', 'ErrorInternalServerError', 'Sync could not be completed');
         }
+    }
+
+    private function syncItemShape(DOMElement $request): string {
+        $shape = EwsSoap::getFirstChild($request, 'ItemShape', EwsSoap::NS_M);
+        if (!$shape) throw new EwsSyncException('ErrorInvalidParameter', 'Missing ItemShape');
+        $base = null;
+        foreach ($shape->childNodes as $child) {
+            if (!$child instanceof DOMElement) continue;
+            if ($child->namespaceURI === EwsSoap::NS_T && $child->localName === 'BaseShape' && $base === null) {
+                $base = trim($child->textContent);
+            } else {
+                throw new EwsSyncException('ErrorInvalidParameter', 'Unsupported ItemShape property');
+            }
+        }
+        if (!in_array($base, ['IdOnly', 'Default', 'AllProperties'], true)) throw new EwsSyncException('ErrorInvalidParameter', 'Unsupported BaseShape');
+        return $base;
+    }
+
+    private function syncItemXml(DOMDocument $dom, string $type, string $folder, string $id, mixed $record, string $shape): string {
+        if (!is_array($record) || !is_array($record['object'] ?? null) || !is_string($record['changeKey'] ?? null) ||
+            !hash_equals($record['changeKey'], EwsConverter::itemChangeKey($record['object']))) throw new RuntimeException('Stored item version mismatch');
+        $tag = match ($type) { 'contacts' => 'Contact', 'calendar' => 'CalendarItem', default => 'Message' };
+        if ($shape === 'IdOnly') return '<t:' . $tag . '>' . EwsSoap::buildId($dom, $id, $record['changeKey']) . '</t:' . $tag . '>';
+        $xml = match ($type) {
+            'contacts' => EwsConverter::contactToXml($dom, $record['object'], $folder),
+            'calendar' => EwsConverter::calendarToXml($dom, $record['object'], $folder),
+            default => EwsConverter::emailToXml($dom, $record['object'], $folder),
+        };
+        $wrapper = new DOMDocument();
+        if (!$wrapper->loadXML('<root xmlns:t="' . EwsSoap::NS_T . '">' . $xml . '</root>', LIBXML_NONET)) throw new RuntimeException('Invalid converted item');
+        $item = $wrapper->documentElement->firstElementChild;
+        if (!$item || $item->namespaceURI !== EwsSoap::NS_T || $item->localName !== $tag) throw new RuntimeException('Invalid converted item type');
+        $itemId = null; $remove = [];
+        foreach ($item->childNodes as $child) {
+            if (!$child instanceof DOMElement || $child->namespaceURI !== EwsSoap::NS_T) continue;
+            if ($child->localName === 'ItemId') {
+                if ($itemId !== null) throw new RuntimeException('Duplicate converted item ID');
+                $itemId = $child;
+            }
+            if (in_array($child->localName, ['Body', 'Attachments'], true)) $remove[] = $child;
+        }
+        if (!$itemId) throw new RuntimeException('Missing converted item ID');
+        $itemId->setAttribute('Id', $id); $itemId->setAttribute('ChangeKey', $record['changeKey']);
+        foreach ($remove as $child) $item->removeChild($child);
+        return $wrapper->saveXML($item);
+    }
+
+    /** Resolve and verify a single sync folder without the generic root/account fallback. */
+    private function syncResolveFolder(DOMElement $request): array {
+        $container = EwsSoap::getFirstChild($request, 'SyncFolderId', EwsSoap::NS_M);
+        if (!$container) throw new EwsSyncException('ErrorInvalidSyncFolderId', 'Missing SyncFolderId');
+        $elements = [];
+        foreach ($container->childNodes as $child) if ($child instanceof DOMElement) $elements[] = $child;
+        if (count($elements) !== 1 || $elements[0]->namespaceURI !== EwsSoap::NS_T ||
+            !in_array($elements[0]->localName, ['FolderId', 'DistinguishedFolderId'], true) ||
+            $elements[0]->getAttribute('Id') === '' || $elements[0]->getElementsByTagNameNS(EwsSoap::NS_T, 'Mailbox')->length) {
+            throw new EwsSyncException('ErrorInvalidSyncFolderId', 'Invalid SyncFolderId');
+        }
+        $el = $elements[0];
+        $id = $el->getAttribute('Id');
+        $dist = $el->localName === 'DistinguishedFolderId';
+        $roleMap = ['inbox' => 'inbox', 'drafts' => 'drafts', 'sentitems' => 'sent', 'deleteditems' => 'trash', 'junkemail' => 'junk'];
+        $distId = strtolower($id);
+        if ($dist && !isset($roleMap[$distId]) && !in_array($distId, ['contacts', 'calendar'], true)) {
+            throw new EwsSyncException('ErrorInvalidSyncFolderId', 'Unsupported distinguished folder');
+        }
+        $type = $dist ? (in_array($distId, ['contacts', 'calendar'], true) ? $distId : 'mail') : $this->folderType($id);
+        $cap = match ($type) { 'contacts' => JmapClient::CAP_CONTACTS, 'calendar' => JmapClient::CAP_CALENDARS, default => JmapClient::CAP_MAIL };
+        $account = $this->client->getCapabilityAccountId($cap);
+        $using = [JmapClient::CAP_CORE, $cap];
+        $method = match ($type) { 'contacts' => 'AddressBook/get', 'calendar' => 'Calendar/get', default => 'Mailbox/get' };
+        $raw = $dist ? null : $this->jmapId($id);
+        if ($raw === '') throw new EwsSyncException('ErrorInvalidSyncFolderId', 'Empty folder ID');
+        $r = $this->syncCall($method, ['accountId' => $account, 'ids' => $raw === null ? null : [$raw]], $using, $account);
+        if (!isset($r['list']) || !is_array($r['list']) || !array_is_list($r['list']) || !isset($r['notFound']) || !is_array($r['notFound']) ||
+            !array_is_list($r['notFound']) || ($dist && $r['notFound'] !== [])) {
+            throw new RuntimeException('Invalid folder get response');
+        }
+        $selected = null;
+        foreach ($r['list'] as $item) {
+            if (!is_array($item) || !isset($item['id']) || !is_string($item['id']) || $item['id'] === '') throw new RuntimeException('Invalid folder object');
+            if (!$dist && $item['id'] === $raw) $selected = $item['id'];
+            elseif ($dist && $type === 'mail' && ($item['role'] ?? null) === $roleMap[$distId]) $selected = $item['id'];
+            elseif ($dist && $type !== 'mail' && ($selected === null || !empty($item['isDefault']))) $selected = $item['id'];
+        }
+        if ($selected === null || (!$dist && (count($r['list']) !== 1 || count($r['notFound']) !== 0))) {
+            throw new EwsSyncException('ErrorInvalidSyncFolderId', 'Folder not found');
+        }
+        $prefix = $type === 'contacts' ? EwsConverter::PFX_CONTACTS : ($type === 'calendar' ? EwsConverter::PFX_CALENDAR : '');
+        return [$type, $selected, $prefix . $selected, $account, $using];
+    }
+
+    private function syncCall(string $method, array $args, array $using, string $account): array {
+        $responses = $this->client->call([[$method, $args, 'sync']], $using);
+        if (count($responses) !== 1 || !isset($responses[0][0], $responses[0][1], $responses[0][2]) ||
+            $responses[0][0] !== $method || $responses[0][2] !== 'sync' || !is_array($responses[0][1]) ||
+            ($responses[0][1]['accountId'] ?? null) !== $account) {
+            throw new RuntimeException('JMAP ' . $method . ' failed or returned an invalid response');
+        }
+        return $responses[0][1];
+    }
+
+    private function syncQuery(string $type, string $folder, string $account, array $using): array {
+        $method = match ($type) { 'contacts' => 'ContactCard/query', 'calendar' => 'CalendarEvent/query', default => 'Email/query' };
+        $filter = match ($type) { 'contacts' => 'inAddressBook', 'calendar' => 'inCalendar', default => 'inMailbox' };
+        $maxItems = defined('EWS_SYNC_MAX_ITEMS') ? EWS_SYNC_MAX_ITEMS : 100000;
+        if (!is_int($maxItems) || $maxItems < 1 || $maxItems > 100000) throw new RuntimeException('Invalid sync item limit');
+        $ids = []; $seen = []; $position = 0; $state = null; $total = null;
+        do {
+            $r = $this->syncCall($method, ['accountId' => $account, 'filter' => [$filter => $folder], 'position' => $position, 'limit' => 100, 'calculateTotal' => true], $using, $account);
+            if (!isset($r['queryState'], $r['position'], $r['total'], $r['ids']) || !is_string($r['queryState']) || $r['queryState'] === '' ||
+                !is_int($r['position']) || $r['position'] !== $position || !is_int($r['total']) || $r['total'] < 0 || $r['total'] > $maxItems ||
+                !is_array($r['ids']) || !array_is_list($r['ids']) || count($r['ids']) > 100 ||
+                ($state !== null && $state !== $r['queryState']) || ($total !== null && $total !== $r['total'])) {
+                throw new RuntimeException('Invalid or changed JMAP query result');
+            }
+            $state = $r['queryState']; $total = $r['total'];
+            foreach ($r['ids'] as $id) {
+                if (!is_string($id) || $id === '' || strlen($id) > 1024) throw new RuntimeException('Invalid JMAP item ID');
+                $key = 'i' . base64_encode($id);
+                if (isset($seen[$key])) throw new RuntimeException('Duplicate JMAP item ID');
+                $seen[$key] = true; $ids[] = $id;
+            }
+            $count = count($r['ids']); $position += $count;
+            if ($position > $total || ($count === 0 && $position < $total)) throw new RuntimeException('Incomplete JMAP query');
+        } while ($position < $total);
+        return [$ids, $state];
+    }
+
+    private static function syncCanonical(mixed $value): mixed {
+        if (!is_array($value)) return $value;
+        if (!array_is_list($value)) ksort($value, SORT_STRING);
+        foreach ($value as $key => $item) $value[$key] = self::syncCanonical($item);
+        return $value;
+    }
+
+    private function syncSnapshot(string $type, string $folder, string $account, array $using): array {
+        [$ids, $queryState] = $this->syncQuery($type, $folder, $account, $using);
+        $method = match ($type) { 'contacts' => 'ContactCard/get', 'calendar' => 'CalendarEvent/get', default => 'Email/get' };
+        $objects = []; $hashes = []; $bytes = 0;
+        // Even an empty result must provide a collection state.
+        $chunks = $ids ? array_chunk($ids, 100) : [[]];
+        foreach ($chunks as $chunk) {
+            $r = $this->syncCall($method, ['accountId' => $account, 'ids' => $chunk], $using, $account);
+            if (!isset($r['state'], $r['list'], $r['notFound']) || !is_string($r['state']) || $r['state'] === '' ||
+                !is_array($r['list']) || !array_is_list($r['list']) || !is_array($r['notFound']) || $r['notFound'] !== [] ||
+                count($r['list']) !== count($chunk)) throw new RuntimeException('Incomplete Jmap get result');
+            $expected = array_fill_keys(array_map(fn($id) => 'i' . base64_encode($id), $chunk), true);
+            foreach ($r['list'] as $object) {
+                if (!is_array($object) || !isset($object['id']) || !is_string($object['id'])) throw new RuntimeException('Invalid JMAP object');
+                unset($object['bodyValues']);
+                $key = 'i' . base64_encode($object['id']);
+                if (!isset($expected[$key]) || isset($objects[$key])) throw new RuntimeException('Unexpected JMAP object');
+                $encoded = json_encode(self::syncCanonical($object), JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+                $bytes += strlen($encoded);
+                if (strlen($encoded) > 1048576 || $bytes > 33554432) throw new RuntimeException('Sync object size limit exceeded');
+                $hashes[$key] = EwsConverter::itemChangeKey($object); $objects[$key] = $object;
+            }
+        }
+        [$verifyIds, $verifyState] = $this->syncQuery($type, $folder, $account, $using);
+        if ($ids !== $verifyIds || $queryState !== $verifyState) throw new RuntimeException('JMAP query changed during sync');
+        ksort($hashes, SORT_STRING);
+        return [$hashes, $objects];
     }
 
     public function getFolder(DOMElement $request): string {
@@ -439,6 +626,16 @@ class EwsOperations {
     public function getItem(DOMElement $request): string {
         try {
             $itemShape = EwsSoap::getFirstChild($request, 'ItemShape');
+            $wantMime = false;
+            if ($itemShape) {
+                $furi = $itemShape->getElementsByTagNameNS(EwsSoap::NS_T, 'FieldURI');
+                for ($i = 0; $i < $furi->length; $i++) {
+                    if ($furi->item($i)->getAttribute('FieldURI') === 'item:MimeContent') {
+                        $wantMime = true;
+                        break;
+                    }
+                }
+            }
 
             $itemIdsEl = EwsSoap::getFirstChild($request, 'ItemIds');
             $itemIdEls = $itemIdsEl ? $itemIdsEl->getElementsByTagNameNS(EwsSoap::NS_T, 'ItemId') : null;
@@ -478,9 +675,8 @@ class EwsOperations {
                     ['Email/get', [
                         'accountId'          => $this->accountId,
                         'ids'                => $mailIds,
-                        'properties'         => ['id', 'blobId', 'mailboxIds', 'keywords', 'size',
-                            'receivedAt', 'subject', 'from', 'to', 'cc', 'bcc', 'replyTo',
-                            'hasAttachment', 'textBody', 'htmlBody', 'attachments', 'bodyValues'],
+                        // Match the default Email/get property set used by sync.
+                        'properties'         => null,
                         'fetchAllBodyValues' => true,
                     ], '0'],
                 ]);
@@ -492,7 +688,7 @@ class EwsOperations {
             if ($contactIds) {
                 $r = $this->client->call([
                     ['ContactCard/get', [
-                        'accountId'  => $this->accountId,
+                        'accountId'  => $this->contactsAccountId,
                         'ids'        => $contactIds,
                         'properties' => null,
                     ], '0'],
@@ -505,7 +701,7 @@ class EwsOperations {
             if ($calendarIds) {
                 $r = $this->client->call([
                     ['CalendarEvent/get', [
-                        'accountId'  => $this->accountId,
+                        'accountId'  => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                         'ids'        => $calendarIds,
                         'properties' => null,
                     ], '0'],
@@ -527,7 +723,7 @@ class EwsOperations {
                     } else {
                         $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Success">' .
                             '<m:ResponseCode>NoError</m:ResponseCode>' .
-                            '<m:Items>' . EwsConverter::contactToXml($dom, $card, '') . '</m:Items>' .
+                            '<m:Items>' . EwsConverter::contactToXml($dom, $card, $this->itemParentFolderId($card, 'addressBookIds', EwsConverter::PFX_CONTACTS)) . '</m:Items>' .
                             '</m:GetItemResponseMessage>';
                     }
                 } elseif (str_starts_with($id, EwsConverter::PFX_CALENDAR)) {
@@ -540,7 +736,7 @@ class EwsOperations {
                     } else {
                         $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Success">' .
                             '<m:ResponseCode>NoError</m:ResponseCode>' .
-                            '<m:Items>' . EwsConverter::calendarToXml($dom, $event, '') . '</m:Items>' .
+                            '<m:Items>' . EwsConverter::calendarToXml($dom, $event, $this->itemParentFolderId($event, 'calendarIds', EwsConverter::PFX_CALENDAR)) . '</m:Items>' .
                             '</m:GetItemResponseMessage>';
                     }
                 } else {
@@ -551,9 +747,24 @@ class EwsOperations {
                             '</m:GetItemResponseMessage>';
                     } else {
                         $mailboxId = array_key_first($email['mailboxIds'] ?? ['0' => true]);
+                        // bodyValues is a fetch-dependent projection, not part of
+                        // the canonical item version used for SyncFolderItems.
+                        $bodyValues = is_array($email['bodyValues'] ?? null) ? $email['bodyValues'] : [];
+                        unset($email['bodyValues']);
+                        $mime = null;
+                        if ($wantMime && !empty($email['blobId'])) {
+                            try {
+                                $raw = $this->client->downloadBlob($email['blobId'], 'message.eml', 'message/rfc822');
+                                if (is_string($raw) && $raw !== '') {
+                                    $mime = $raw;
+                                }
+                            } catch (\Throwable $e) {
+                                $this->logDebug("MimeContent download failed for $id: " . $e->getMessage());
+                            }
+                        }
                         $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Success">' .
                             '<m:ResponseCode>NoError</m:ResponseCode>' .
-                            '<m:Items>' . EwsConverter::emailToXml($dom, $email, $mailboxId ?? '0') . '</m:Items>' .
+                            '<m:Items>' . EwsConverter::emailToXml($dom, $email, $mailboxId ?? '0', $bodyValues, $mime) . '</m:Items>' .
                             '</m:GetItemResponseMessage>';
                     }
                 }
@@ -615,14 +826,15 @@ class EwsOperations {
                         break;
 
                     case 'Contact':
-                        $abId = $parentFolderId
+                        $abId = $parentFolderId !== $this->accountId
                             ? $this->jmapId($parentFolderId)
-                            : $this->contactsAccountId;
+                            : $this->getDefaultAddressBookId();
+                        if ($abId === null || $abId === '') throw new RuntimeException('No address book available');
                         $card = EwsConverter::ewsContactToCard($itemNode, $abId);
                         try {
                             $r = $this->client->call([
                                 ['ContactCard/set', [
-                                    'accountId' => $this->accountId,
+                                    'accountId' => $this->contactsAccountId,
                                     'create'    => ['c1' => $card],
                                 ], '0'],
                             ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
@@ -636,14 +848,17 @@ class EwsOperations {
                         break;
 
                     case 'CalendarItem':
-                        $calId = $parentFolderId
+                        $explicitFolder = $savedFolderIdEl?->getElementsByTagNameNS(EwsSoap::NS_T, 'FolderId')->item(0);
+                        if ($explicitFolder && $explicitFolder->getAttribute('Id') === '') throw new RuntimeException('Empty calendar ID');
+                        $calId = $explicitFolder || $parentFolderId !== $this->accountId
                             ? $this->jmapId($parentFolderId)
-                            : ($this->getDefaultCalendarId() ?: 'default');
+                            : $this->getDefaultCalendarId(true);
+                        if ($calId === null || $calId === '') throw new RuntimeException('No calendar available');
                         $event = EwsConverter::ewsEventToJmap($itemNode, $calId);
                         try {
                             $r = $this->client->call([
                                 ['CalendarEvent/set', [
-                                    'accountId' => $this->accountId,
+                                    'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                                     'create'    => ['ev1' => $event],
                                 ], '0'],
                             ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
@@ -754,7 +969,7 @@ class EwsOperations {
                         case 'contacts':
                             $r = $this->client->call([
                                 ['ContactCard/set', [
-                                    'accountId' => $this->accountId,
+                                    'accountId' => $this->contactsAccountId,
                                     'destroy'   => [$jmapId],
                                 ], '0'],
                             ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
@@ -764,7 +979,7 @@ class EwsOperations {
                         case 'calendar':
                             $r = $this->client->call([
                                 ['CalendarEvent/set', [
-                                    'accountId' => $this->accountId,
+                                    'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                                     'destroy'   => [$jmapId],
                                 ], '0'],
                             ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
@@ -936,44 +1151,54 @@ class EwsOperations {
             $attachmentIdsEl = EwsSoap::getFirstChild($request, 'AttachmentIds');
             $idEls = $attachmentIdsEl ? $attachmentIdsEl->getElementsByTagNameNS(EwsSoap::NS_T, 'AttachmentId') : null;
 
+            // Garantieer altijd een geldig antwoordskelet voor eM Client
+            $fallbackResponse = '<m:AttachmentResponseMessage ResponseClass="Error">' .
+                '<m:MessageText>No attachment IDs provided</m:MessageText>' .
+                '<m:ResponseCode>ErrorInvalidAttachmentId</m:ResponseCode>' .
+                '</m:AttachmentResponseMessage>';
+
             $responsesXml = '';
 
-            if ($idEls) {
+            if ($idEls && $idEls->length > 0) {
                 for ($i = 0; $i < $idEls->length; $i++) {
-                    $attId = $idEls->item($i)->getAttribute('Id');
-                    $parts = explode('||', $attId, 3);
-                    $blobId = $parts[1] ?? '';
-                    $name   = $parts[2] ?? 'attachment';
-
-                    if (!$blobId) {
-                        $responsesXml .= '<m:AttachmentResponseMessage ResponseClass="Error">' .
-                            '<m:MessageText></m:MessageText><m:ResponseCode>ErrorInvalidAttachmentId</m:ResponseCode>' .
-                            '</m:AttachmentResponseMessage>';
-                        continue;
-                    }
-
                     try {
-                        $data = $this->client->downloadBlob($blobId, $name);
+                        $attId = $idEls->item($i)->getAttribute('Id');
+                        $parts = explode('||', $attId, 3);
+                        $blobId = $parts[1] ?? '';
+                        $name   = $parts[2] ?? 'attachment';
+
+                        if (!$blobId) {
+                            $responsesXml .= $fallbackResponse;
+                            continue;
+                        }
+
+                        $data = @$this->client->downloadBlob($blobId, $name);
                         $contentType = $this->extToMime(strtolower(pathinfo($name, PATHINFO_EXTENSION)));
 
-                        $responsesXml .= '<m:AttachmentResponseMessage ResponseClass="Success">' .
-                            '<m:ResponseCode>NoError</m:ResponseCode>' .
-                            '<m:Attachments>' .
-                            '<t:FileAttachment>' .
-                            '<t:AttachmentId Id="' . EwsSoap::escapeXml($attId) . '"/>' .
-                            '<t:Name>' . EwsSoap::escapeXml($name) . '</t:Name>' .
-                            '<t:ContentType>' . EwsSoap::escapeXml($contentType) . '</t:ContentType>' .
-                            '<t:Content>' . base64_encode($data) . '</t:Content>' .
-                            '</t:FileAttachment>' .
-                            '</m:Attachments>' .
-                            '</m:AttachmentResponseMessage>';
+                        if ($data === false || $data === '') {
+                            $responsesXml .= $fallbackResponse;
+                        } else {
+                            $responsesXml .= '<m:AttachmentResponseMessage ResponseClass="Success">' .
+                                '<m:ResponseCode>NoError</m:ResponseCode>' .
+                                '<m:Attachments>' .
+                                '<t:FileAttachment>' .
+                                '<t:AttachmentId Id="' . EwsSoap::escapeXml($attId) . '"/>' .
+                                '<t:Name>' . EwsSoap::escapeXml($name) . '</t:Name>' .
+                                '<t:ContentType>' . EwsSoap::escapeXml($contentType) . '</t:ContentType>' .
+                                '<t:Content>' . base64_encode($data) . '</t:Content>' .
+                                '</t:FileAttachment>' .
+                                '</m:Attachments>' .
+                                '</m:AttachmentResponseMessage>';
+                        }
                     } catch (\Throwable $e2) {
-                        $responsesXml .= '<m:AttachmentResponseMessage ResponseClass="Error">' .
-                            '<m:MessageText>' . EwsSoap::escapeXml($e2->getMessage()) . '</m:MessageText>' .
-                            '<m:ResponseCode>ErrorInternalServerError</m:ResponseCode>' .
-                            '</m:AttachmentResponseMessage>';
+                        $responsesXml .= $fallbackResponse;
                     }
                 }
+            }
+
+            // Altijd een validatie-safeguard: als responsesXml leeg of ongeldig is, fallback gebruiken
+            if (!$responsesXml || strpos($responsesXml, 'm:AttachmentResponseMessage') === false) {
+                $responsesXml = $fallbackResponse;
             }
 
             $bodyXml = '<m:GetAttachmentResponse>' .
@@ -983,7 +1208,17 @@ class EwsOperations {
             return EwsSoap::buildSoapResponse($bodyXml);
 
         } catch (\Throwable $e) {
-            return $this->errorResponse('GetAttachment', 'ErrorInternalServerError', $e->getMessage());
+            // Nog een laatste fallback via errorResponse, maar vorm it op zodat de structuur klopt
+            $msgName = 'AttachmentResponseMessage';
+            $bodyXml = '<m:GetAttachmentResponse>' .
+                '<m:ResponseMessages>' .
+                '<m:' . $msgName . ' ResponseClass="Error">' .
+                '<m:MessageText>Internal error retrieving attachments</m:MessageText>' .
+                '<m:ResponseCode>ErrorInternalServerError</m:ResponseCode>' .
+                '</m:' . $msgName . '>' .
+                '</m:ResponseMessages>' .
+                '</m:GetAttachmentResponse>';
+            return EwsSoap::buildSoapResponse($bodyXml);
         }
     }
 
@@ -1003,18 +1238,19 @@ class EwsOperations {
                 return EwsSoap::buildSoapResponse($bodyXml);
             }
 
-            $r = $this->client->call([
+            $addressBookId = $this->getDefaultAddressBookId();
+            $r = $addressBookId !== null && $addressBookId !== '' ? $this->client->call([
                 ['ContactCard/query', [
-                    'accountId' => $this->accountId,
-                    'filter'    => ['inAddressBook' => $this->contactsAccountId],
+                    'accountId' => $this->contactsAccountId,
+                    'filter'    => ['inAddressBook' => $addressBookId],
                     'limit'     => 500,
                 ], 'q'],
                 ['ContactCard/get', [
-                    'accountId'  => $this->accountId,
+                    'accountId'  => $this->contactsAccountId,
                     '#ids'       => ['resultOf' => 'q', 'name' => 'ContactCard/query', 'path' => '/ids'],
                     'properties' => $returnFullContactData ? null : ['id', 'name', 'emails'],
                 ], 'g'],
-            ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
+            ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]) : [];
 
             $cards = $r[1][1]['list'] ?? [];
             $dom = new DOMDocument();
@@ -1087,7 +1323,7 @@ class EwsOperations {
 
             $r = $this->client->call([
                 ['CalendarEvent/query', [
-                    'accountId' => $this->accountId,
+                    'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                     'filter'    => [
                         'after'  => gmdate('Y-m-d\TH:i:s\Z', strtotime($startTime)),
                         'before' => gmdate('Y-m-d\TH:i:s\Z', strtotime($endTime)),
@@ -1095,7 +1331,7 @@ class EwsOperations {
                     'limit'     => 500,
                 ], 'q'],
                 ['CalendarEvent/get', [
-                    'accountId'  => $this->accountId,
+                    'accountId'  => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                     '#ids'       => ['resultOf' => 'q', 'name' => 'CalendarEvent/query', 'path' => '/ids'],
                     'properties' => ['id', 'title', 'start', 'duration', 'freeBusyStatus', 'showWithoutTime'],
                 ], 'g'],
@@ -1327,12 +1563,12 @@ class EwsOperations {
 
         $r = $this->client->call([
             ['ContactCard/query', [
-                'accountId' => $this->accountId,
+                'accountId' => $this->contactsAccountId,
                 'filter'    => ['inAddressBook' => $abId],
                 'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
             ], 'q'],
             ['ContactCard/get', [
-                'accountId'  => $this->accountId,
+                'accountId'  => $this->contactsAccountId,
                 '#ids'       => ['resultOf' => 'q', 'name' => 'ContactCard/query', 'path' => '/ids'],
                 'properties' => null,
             ], 'g'],
@@ -1340,7 +1576,7 @@ class EwsOperations {
 
         $qRes = $r[0][1] ?? [];
         $cards = $r[1][1]['list'] ?? [];
-        $currentIds = array_column($cards, 'id');
+        $currentIds = array_map(fn($c) => EwsConverter::PFX_CONTACTS . $c['id'], $cards);
         $hasMore = !empty($qRes['more']);
         $nextPos = $hasMore ? ((int)($qRes['position'] ?? 0) + count($currentIds)) : null;
         $folderId = EwsConverter::PFX_CONTACTS . $abId;
@@ -1348,12 +1584,12 @@ class EwsOperations {
 
         if ($prevIds) {
             $deletedIds = array_diff($prevIds, $currentIds);
-            $createdIds = array_diff($currentIds, $prevIds);
+            $createdJmapIds = array_map(fn($ci) => substr($ci, strlen(EwsConverter::PFX_CONTACTS)), array_diff($currentIds, $prevIds));
 
             $this->logSync("contacts ab=$abId prev=" . json_encode($prevIds) .
                 " current=" . json_encode($currentIds) .
                 " deleted=" . json_encode(array_values($deletedIds)) .
-                " created=" . json_encode(array_values($createdIds)));
+                " created=" . json_encode(array_values($createdJmapIds)));
 
             foreach ($deletedIds as $delId) {
                 $changesXml .= '<t:Delete>' .
@@ -1362,7 +1598,7 @@ class EwsOperations {
             }
 
             foreach ($cards as $card) {
-                if (in_array($card['id'], $createdIds)) {
+                if (in_array(EwsConverter::PFX_CONTACTS . $card['id'], $createdJmapIds)) {
                     $changesXml .= '<t:Create>' .
                         EwsConverter::contactToXml($dom, $card, $folderId) .
                         '</t:Create>';
@@ -1382,13 +1618,13 @@ class EwsOperations {
     private function contactDownloadPage(DOMDocument $dom, string $abId, int $position, int $maxChanges): array {
         $r = $this->client->call([
             ['ContactCard/query', [
-                'accountId' => $this->accountId,
+                'accountId' => $this->contactsAccountId,
                 'filter'    => ['inAddressBook' => $abId],
                 'position'  => $position,
                 'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
             ], 'q'],
             ['ContactCard/get', [
-                'accountId'  => $this->accountId,
+                'accountId'  => $this->contactsAccountId,
                 '#ids'       => ['resultOf' => 'q', 'name' => 'ContactCard/query', 'path' => '/ids'],
                 'properties' => null,
             ], 'g'],
@@ -1396,7 +1632,7 @@ class EwsOperations {
 
         $qRes = $r[0][1] ?? [];
         $cards = $r[1][1]['list'] ?? [];
-        $currentIds = array_column($cards, 'id');
+        $currentIds = array_map(fn($c) => EwsConverter::PFX_CONTACTS . $c['id'], $cards);
         $hasMore = !empty($qRes['more']);
         $nextPos = $hasMore ? ((int)($qRes['position'] ?? $position) + count($currentIds)) : null;
         $folderId = EwsConverter::PFX_CONTACTS . $abId;
@@ -1418,13 +1654,13 @@ class EwsOperations {
 
         $r = $this->client->call([
             ['CalendarEvent/query', [
-                'accountId' => $this->accountId,
+                'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                 'filter'    => ['inCalendar' => $calId],
                 'sort'      => [['property' => 'start', 'isAscending' => false]],
                 'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
             ], 'q'],
             ['CalendarEvent/get', [
-                'accountId'  => $this->accountId,
+                'accountId'  => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                 '#ids'       => ['resultOf' => 'q', 'name' => 'CalendarEvent/query', 'path' => '/ids'],
                 'properties' => null,
             ], 'g'],
@@ -1432,7 +1668,7 @@ class EwsOperations {
 
         $qRes = $r[0][1] ?? [];
         $events = $r[1][1]['list'] ?? [];
-        $currentIds = array_column($events, 'id');
+        $currentIds = array_map(fn($e) => EwsConverter::PFX_CALENDAR . $e['id'], $events);
         $hasMore = !empty($qRes['more']);
         $nextPos = $hasMore ? ((int)($qRes['position'] ?? 0) + count($currentIds)) : null;
         $folderId = EwsConverter::PFX_CALENDAR . $calId;
@@ -1440,12 +1676,12 @@ class EwsOperations {
 
         if ($prevIds) {
             $deletedIds = array_diff($prevIds, $currentIds);
-            $createdIds = array_diff($currentIds, $prevIds);
+            $createdJmapIds = array_map(fn($ci) => substr($ci, strlen(EwsConverter::PFX_CALENDAR)), array_diff($currentIds, $prevIds));
 
             $this->logSync("calendar cal=$calId prev=" . json_encode($prevIds) .
                 " current=" . json_encode($currentIds) .
                 " deleted=" . json_encode(array_values($deletedIds)) .
-                " created=" . json_encode(array_values($createdIds)));
+                " created=" . json_encode(array_values($createdJmapIds)));
 
             foreach ($deletedIds as $delId) {
                 $changesXml .= '<t:Delete>' .
@@ -1454,7 +1690,7 @@ class EwsOperations {
             }
 
             foreach ($events as $event) {
-                if (in_array($event['id'], $createdIds)) {
+                if (in_array(EwsConverter::PFX_CALENDAR . $event['id'], $createdJmapIds)) {
                     $changesXml .= '<t:Create>' .
                         EwsConverter::calendarToXml($dom, $event, $folderId) .
                         '</t:Create>';
@@ -1474,14 +1710,14 @@ class EwsOperations {
     private function calendarDownloadPage(DOMDocument $dom, string $calId, int $position, int $maxChanges): array {
         $r = $this->client->call([
             ['CalendarEvent/query', [
-                'accountId' => $this->accountId,
+                'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                 'filter'    => ['inCalendar' => $calId],
                 'sort'      => [['property' => 'start', 'isAscending' => false]],
                 'position'  => $position,
                 'limit'     => max(1, min($maxChanges, JMAP_MAX_OBJECTS_PER_REQUEST)),
             ], 'q'],
             ['CalendarEvent/get', [
-                'accountId'  => $this->accountId,
+                'accountId'  => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                 '#ids'       => ['resultOf' => 'q', 'name' => 'CalendarEvent/query', 'path' => '/ids'],
                 'properties' => null,
             ], 'g'],
@@ -1489,7 +1725,7 @@ class EwsOperations {
 
         $qRes = $r[0][1] ?? [];
         $events = $r[1][1]['list'] ?? [];
-        $currentIds = array_column($events, 'id');
+        $currentIds = array_map(fn($e) => EwsConverter::PFX_CALENDAR . $e['id'], $events);
         $hasMore = !empty($qRes['more']);
         $nextPos = $hasMore ? ((int)($qRes['position'] ?? $position) + count($currentIds)) : null;
         $folderId = EwsConverter::PFX_CALENDAR . $calId;
@@ -1504,6 +1740,24 @@ class EwsOperations {
         return [$changesXml, $currentIds, $hasMore, $nextPos];
     }
 
+    private function itemParentFolderId(array $item, string $property, string $prefix): ?string {
+        $memberships = $item[$property] ?? null;
+        if (is_array($memberships)) {
+            foreach ($memberships as $id => $member) {
+                if ((is_string($id) || is_int($id)) && (string)$id !== '' && $member === true) {
+                    return $prefix . (string)$id;
+                }
+            }
+        }
+        return null;
+    }
+
+    private function logDebug(string $msg): void {
+        if (defined('LOGLEVEL_DEBUG')) {
+            error_log('[EWS-DEBUG] ' . $msg);
+        }
+    }
+
     private function logSync(string $msg): void {
         if (defined('LOGLEVEL_DEBUG')) {
             error_log('[EWS-SYNC] ' . $msg);
@@ -1513,23 +1767,42 @@ class EwsOperations {
     private function updateContact(string $id, DOMElement $updates): string {
         $jmapId = $this->jmapId($id);
         $patch = [];
+        $nameChanges = [];
+        $nameFields = [
+            'contacts:GivenName' => 'given', 'contacts:Surname' => 'surname',
+            'contacts:MiddleName' => 'additional', 'contacts:Title' => 'prefix',
+            'contacts:Suffix' => 'suffix', 'contacts:DisplayName' => 'full',
+        ];
 
-        $setFieldEls = $updates->getElementsByTagNameNS(EwsSoap::NS_T, 'SetItemField');
-        for ($i = 0; $i < $setFieldEls->length; $i++) {
-            $field = $setFieldEls->item($i);
-            $path = EwsSoap::getFirstChild($field, 'FieldURI');
+        foreach ($updates->childNodes as $field) {
+            if (!$field instanceof DOMElement) continue;
+            if ($field->namespaceURI !== EwsSoap::NS_T || $field->localName !== 'SetItemField') {
+                return $this->contactUpdateError('ErrorInvalidPropertySet', 'Unsupported contact update operation');
+            }
+            $path = null; $valueEl = null;
+            foreach ($field->childNodes as $child) {
+                if (!$child instanceof DOMElement) continue;
+                if ($child->namespaceURI === EwsSoap::NS_T && $child->localName === 'FieldURI' && $path === null) {
+                    $path = $child;
+                } elseif ($child->namespaceURI === EwsSoap::NS_T && in_array($child->localName, ['Contact', 'Value'], true) && $valueEl === null) {
+                    $valueEl = $child;
+                } else {
+                    return $this->contactUpdateError('ErrorInvalidPropertySet', 'Unsupported contact property path or update');
+                }
+            }
             $fieldUri = $path ? $path->getAttribute('FieldURI') : '';
-            $valueEl = EwsSoap::getFirstChild($field, 'Contact') ?: EwsSoap::getFirstChild($field, 'Value');
+            if ($fieldUri === '' || !$valueEl) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Missing contact property path or value');
 
-            if (!$fieldUri || !$valueEl) continue;
-
+            if (isset($nameFields[$fieldUri])) {
+                if (!$valueEl) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Missing contact name value');
+                $nameValue = $valueEl->localName === 'Contact'
+                    ? EwsSoap::getFirstChild($valueEl, substr($fieldUri, strpos($fieldUri, ':') + 1), EwsSoap::NS_T)
+                    : $valueEl;
+                if (!$nameValue) return $this->contactUpdateError('ErrorInvalidPropertySet', 'Missing contact name value');
+                $nameChanges[$nameFields[$fieldUri]] = trim($nameValue->textContent);
+                continue;
+            }
             switch ($fieldUri) {
-                case 'contacts:GivenName':
-                    $patch['name'] = ($patch['name'] ?? []) + ['given' => trim($valueEl->textContent)];
-                    break;
-                case 'contacts:Surname':
-                    $patch['name'] = ($patch['name'] ?? []) + ['surname' => trim($valueEl->textContent)];
-                    break;
                 case 'contacts:CompanyName':
                     $patch['organizations'] = ['o1' => ['name' => trim($valueEl->textContent)]];
                     break;
@@ -1567,37 +1840,186 @@ class EwsOperations {
                 case 'contacts:BusinessState':
                 case 'contacts:BusinessPostalCode':
                 case 'contacts:BusinessCountry':
-                    break;
+                default:
+                    return $this->contactUpdateError('ErrorInvalidPropertySet', 'Unsupported contact property: ' . $fieldUri);
             }
         }
 
-        if (empty($patch)) {
-            return '<m:ItemResponseMessage ResponseClass="Success">' .
-                '<m:ResponseCode>NoError</m:ResponseCode>' .
-                EwsSoap::buildId(new DOMDocument(), $id, $jmapId) .
-                '</m:ItemResponseMessage>';
+        if (empty($patch) && empty($nameChanges)) {
+            return $this->contactUpdateError('ErrorInvalidPropertySet', 'No supported contact updates');
         }
 
         try {
+            $state = null;
+            if ($nameChanges) {
+                $get = $this->client->call([
+                    ['ContactCard/get', ['accountId' => $this->contactsAccountId, 'ids' => [$jmapId], 'properties' => null], '0'],
+                ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
+                if (($get[0][0] ?? '') !== 'ContactCard/get' || !is_array($get[0][1] ?? null)) {
+                    return $this->contactUpdateError('ErrorInternalServerError', 'Contact read failed');
+                }
+                $result = $get[0][1];
+                if (!is_string($result['state'] ?? null) || $result['state'] === '' || !is_array($result['list'] ?? null)) {
+                    return $this->contactUpdateError('ErrorInternalServerError', 'Contact read did not include state and list');
+                }
+                if (count($result['list']) === 0 && in_array($jmapId, $result['notFound'] ?? [], true)) {
+                    return $this->contactUpdateError('ErrorItemNotFound', 'Contact not found');
+                }
+                if (count($result['list']) !== 1 || ($result['list'][0]['id'] ?? null) !== $jmapId) {
+                    return $this->contactUpdateError('ErrorInternalServerError', 'Unexpected contact read result');
+                }
+                $state = $result['state'];
+                $name = $this->mergeContactName($result['list'][0], $nameChanges);
+                $patch['name'] = $name;
+            }
+            $arguments = ['accountId' => $this->contactsAccountId, 'update' => [$jmapId => $patch]];
+            if ($state !== null) $arguments['ifInState'] = $state;
             $r = $this->client->call([
-                ['ContactCard/set', [
-                    'accountId' => $this->accountId,
-                    'update'    => [$jmapId => $patch],
-                ], '0'],
+                ['ContactCard/set', $arguments, '0'],
             ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
 
-            $success = isset($r[0][1]['updated'][$jmapId]);
+            $type = $r[0][1]['type'] ?? '';
+            if (($r[0][0] ?? '') === 'error') {
+                return $this->contactUpdateError($type === 'stateMismatch' ? 'ErrorIrresolvableConflict' : 'ErrorInternalServerError', 'Contact update failed: ' . $type);
+            }
+            if (($r[0][0] ?? '') !== 'ContactCard/set' || !is_array($r[0][1] ?? null)) {
+                return $this->contactUpdateError('ErrorInternalServerError', 'Unexpected contact update result');
+            }
+            $success = is_array($r[0][1]['updated'] ?? null) && array_key_exists($jmapId, $r[0][1]['updated']);
+            if (!$success) {
+                $type = $r[0][1]['notUpdated'][$jmapId]['type'] ?? '';
+                return $this->contactUpdateError($type === 'notFound' ? 'ErrorItemNotFound' : ($type === 'stateMismatch' ? 'ErrorIrresolvableConflict' : 'ErrorInternalServerError'), 'Contact update failed: ' . $type);
+            }
             return '<m:ItemResponseMessage ResponseClass="' . ($success ? 'Success' : 'Error') . '">' .
                 '<m:MessageText></m:MessageText>' .
                 '<m:ResponseCode>' . ($success ? 'NoError' : 'ErrorItemNotFound') . '</m:ResponseCode>' .
                 EwsSoap::buildId(new DOMDocument(), $id, $jmapId) .
                 '</m:ItemResponseMessage>';
+        } catch (DomainException $e) {
+            return $this->contactUpdateError('ErrorInvalidPropertySet', $e->getMessage());
         } catch (\Throwable $e) {
             return '<m:ItemResponseMessage ResponseClass="Error">' .
                 '<m:MessageText>' . EwsSoap::escapeXml($e->getMessage()) . '</m:MessageText>' .
                 '<m:ResponseCode>ErrorInternalServerError</m:ResponseCode>' .
                 '</m:ItemResponseMessage>';
         }
+    }
+
+    private function contactUpdateError(string $code, string $message): string {
+        return '<m:ItemResponseMessage ResponseClass="Error"><m:MessageText>' . EwsSoap::escapeXml($message) .
+            '</m:MessageText><m:ResponseCode>' . EwsSoap::escapeXml($code) . '</m:ResponseCode></m:ItemResponseMessage>';
+    }
+
+    private function mergeContactName(array $card, array $changes): ?array {
+        $name = $card['name'] ?? [];
+        if (!is_array($name)) throw new DomainException('Unsupported contact name');
+        foreach (($card['localizations'] ?? []) as $localization) {
+            if (!is_array($localization)) throw new DomainException('Unsupported contact localizations');
+            foreach ($localization as $path => $_) {
+                if ($path === 'name' || str_starts_with((string)$path, 'name/')) {
+                    throw new DomainException('Localized contact names cannot be safely updated');
+                }
+            }
+        }
+        $kinds = [
+            'given' => ['given'], 'surname' => ['surname', 'surname2'],
+            'additional' => ['given2', 'additional'], 'prefix' => ['title', 'prefix'],
+            'suffix' => ['credential', 'generation', 'suffix'],
+        ];
+        $canonical = ['given' => 'given', 'surname' => 'surname', 'additional' => 'given2', 'prefix' => 'title', 'suffix' => 'credential'];
+        $rank = ['prefix' => 0, 'given' => 1, 'additional' => 2, 'surname' => 3, 'suffix' => 4];
+        $components = $name['components'] ?? [];
+        if (!is_array($components) || !array_is_list($components)) throw new DomainException('Unsupported name components');
+        $componentChanges = array_diff_key($changes, ['full' => true]);
+        foreach ($componentChanges as $value) {
+            if ($value === '') throw new DomainException('Clearing contact name components is not supported');
+        }
+
+        // A legacy-only name can be migrated without guessing how to order existing components.
+        if ($componentChanges && !$components) {
+            foreach (['prefix', 'given', 'additional', 'surname', 'suffix'] as $group) {
+                if (isset($name[$group]) && (!is_string($name[$group]))) throw new DomainException('Unsupported legacy name');
+                if (($name[$group] ?? '') !== '') $components[] = ['kind' => $canonical[$group], 'value' => $name[$group]];
+            }
+            if ($components) $name['isOrdered'] = true;
+        }
+        $groupOf = static function ($component) use ($kinds): ?string {
+            if (!is_array($component) || !is_string($component['kind'] ?? null) || !is_string($component['value'] ?? null)) {
+                throw new DomainException('Unsupported name component');
+            }
+            foreach ($kinds as $group => $aliases) if (in_array($component['kind'], $aliases, true)) return $group;
+            return null;
+        };
+        foreach ($components as $component) $groupOf($component);
+
+        if ($componentChanges && !array_key_exists('full', $changes) && isset($name['full'])) {
+            if (!is_string($name['full']) || $name['full'] !== $this->renderContactName($name, $components)) {
+                throw new DomainException('Custom display name requires an explicit DisplayName update');
+            }
+        }
+        foreach ($componentChanges as $group => $value) {
+            $matches = [];
+            foreach ($components as $i => $component) if ($groupOf($component) === $group) $matches[] = $i;
+            if (count($matches) > 1) throw new DomainException('Multiple name components cannot be safely replaced');
+            foreach ($kinds[$group] as $kind) {
+                if (array_key_exists($kind, $name['sortAs'] ?? [])) throw new DomainException('Sorted name components cannot be safely updated');
+            }
+            if ($matches) {
+                $i = $matches[0];
+                if (isset($components[$i]['phonetic'])) throw new DomainException('Phonetic name components cannot be safely updated');
+                $components[$i]['value'] = $value;
+            } else {
+                // Insertion around explicit separators or in a non-standard order is ambiguous.
+                $insert = count($components);
+                $lastRank = -1;
+                foreach ($components as $i => $component) {
+                    $existing = $groupOf($component);
+                    if ($existing === null || $rank[$existing] < $lastRank) throw new DomainException('Cannot safely insert into this name');
+                    $lastRank = $rank[$existing];
+                    if ($rank[$existing] > $rank[$group] && $insert === count($components)) $insert = $i;
+                }
+                array_splice($components, $insert, 0, [['kind' => $canonical[$group], 'value' => $value]]);
+                if (count($components) === 1) $name['isOrdered'] = true;
+            }
+            if (array_key_exists($group, $name)) $name[$group] = $value;
+        }
+        if ($componentChanges) {
+            foreach ($kinds as $group => $_) {
+                if (!isset($name[$group]) || $name[$group] === '') continue;
+                $found = false;
+                foreach ($components as $component) if ($groupOf($component) === $group) $found = true;
+                if (!$found) throw new DomainException('Mixed legacy name cannot be safely updated');
+            }
+        }
+        if ($componentChanges) $name['components'] = $components;
+        if (array_key_exists('full', $changes)) {
+            if ($changes['full'] === '') throw new DomainException('Clearing DisplayName is not supported');
+            $name['full'] = $changes['full'];
+        } elseif ($componentChanges && isset($name['full'])) {
+            $name['full'] = $this->renderContactName($name, $components);
+        }
+        return $name ?: null;
+    }
+
+    private function renderContactName(array $name, array $components): string {
+        if (!$components) return '';
+        if (($name['isOrdered'] ?? false) !== true) throw new DomainException('Unordered name requires an explicit DisplayName update');
+        $default = $name['defaultSeparator'] ?? ' ';
+        if (!is_string($default)) throw new DomainException('Unsupported name separator');
+        $result = '';
+        $separator = null;
+        $hasPart = false;
+        foreach ($components as $component) {
+            if ($component['kind'] === 'separator') {
+                $separator = ($separator ?? '') . $component['value'];
+            } elseif ($component['value'] !== '') {
+                if ($hasPart) $result .= $separator ?? $default;
+                $result .= $component['value'];
+                $separator = null;
+                $hasPart = true;
+            }
+        }
+        return $result;
     }
 
     private function updateCalendarEvent(string $id, DOMElement $updates): string {
@@ -1680,7 +2102,7 @@ class EwsOperations {
         try {
             $r = $this->client->call([
                 ['CalendarEvent/set', [
-                    'accountId' => $this->accountId,
+                    'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                     'update'    => [$jmapId => $patch],
                 ], '0'],
             ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
@@ -1782,7 +2204,7 @@ class EwsOperations {
 
     private function getAllAddressBooks(): array {
         $r = $this->client->call([
-            ['AddressBook/get', ['accountId' => $this->accountId, 'ids' => null], '0'],
+            ['AddressBook/get', ['accountId' => $this->contactsAccountId, 'ids' => null], '0'],
         ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
         $list = $r[0][1]['list'] ?? [];
         return array_map(fn($ab) => $ab + ['type' => 'contacts'], $list);
@@ -1790,7 +2212,7 @@ class EwsOperations {
 
     private function getAllCalendars(): array {
         $r = $this->client->call([
-            ['Calendar/get', ['accountId' => $this->accountId, 'ids' => null], '0'],
+            ['Calendar/get', ['accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS), 'ids' => null], '0'],
         ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
         $list = $r[0][1]['list'] ?? [];
         return array_map(fn($cal) => $cal + ['type' => 'calendar'], $list);
@@ -1802,7 +2224,7 @@ class EwsOperations {
                 case 'contacts':
                     $r = $this->client->call([
                         ['ContactCard/query', [
-                            'accountId' => $this->accountId,
+                            'accountId' => $this->contactsAccountId,
                             'filter'    => ['inAddressBook' => $jmapId],
                             'limit'     => 1,
                         ], '0'],
@@ -1811,7 +2233,7 @@ class EwsOperations {
                 case 'calendar':
                     $r = $this->client->call([
                         ['CalendarEvent/query', [
-                            'accountId' => $this->accountId,
+                            'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
                             'filter'    => ['inCalendar' => $jmapId],
                             'limit'     => 1,
                         ], '0'],
@@ -1906,12 +2328,12 @@ class EwsOperations {
         return $this->getMailboxIdByRole('sent');
     }
 
-    private function getDefaultCalendarId(): ?string {
+    private function getDefaultCalendarId(bool $requireDefault = false): ?string {
         $cals = $this->getAllCalendars();
         foreach ($cals as $cal) {
             if (!empty($cal['isDefault'])) return $cal['id'];
         }
-        return $cals[0]['id'] ?? null;
+        return $requireDefault ? null : ($cals[0]['id'] ?? null);
     }
 
     private function getIdentityId(): string {

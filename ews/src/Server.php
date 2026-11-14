@@ -154,9 +154,7 @@ class EwsServer {
         $operation = EwsSoap::getOperation($body);
         $opElement = EwsSoap::getOperationElement($body);
 
-        $opXml = $opElement ? $opElement->ownerDocument->saveXML($opElement) : 'null';
         $this->logDebug("EWS operation: $operation");
-        $this->logDebug("EWS request (full): " . substr($rawBody, 0, 4000));
 
         $ops = new EwsOperations($client);
 
@@ -178,6 +176,12 @@ class EwsServer {
                 'ConvertId'              => $ops->convertId($opElement),
                 'GetRoomLists'           => $ops->getRoomLists(),
                 'GetRooms'               => $ops->getRooms(),
+                'CreateFolder',
+                'UpdateFolder',
+                'DeleteFolder',
+                'MoveFolder',
+                'CopyFolder',
+                'EmptyFolder'            => $this->unknownOperationResponse($operation),
                 'GetUserConfiguration',
                 'SetUserConfiguration'   => $this->emptySuccessResponse($operation),
                 'Subscribe'              => $this->emptySuccessResponse($operation),
@@ -188,7 +192,6 @@ class EwsServer {
             };
 
             $this->logDebug("EWS response: " . $operation . " (" . strlen($response) . " bytes)");
-            $this->logDebug("EWS response body: " . substr($response, 0, 4000));
             echo $response;
         } catch (\Throwable $e) {
             $this->logError("Operation $operation failed: " . $e->getMessage());

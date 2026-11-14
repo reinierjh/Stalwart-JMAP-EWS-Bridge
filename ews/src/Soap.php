@@ -63,7 +63,12 @@ class EwsSoap {
     }
 
     public static function escapeXml(string $value): string {
-        return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+        $value = (string)$value;
+        $clean = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $value);
+        if ($clean === null || $clean === false) {
+            $clean = $value;
+        }
+        return htmlspecialchars($clean, ENT_XML1 | ENT_QUOTES, 'UTF-8');
     }
 
     public static function getHeader(DOMDocument $dom, string $localName): string {
