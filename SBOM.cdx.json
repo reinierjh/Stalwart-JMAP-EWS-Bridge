@@ -131,7 +131,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "27854d5f0d2c07786165e202a30217d430748e9686fca7159a32d886b84fb78c"
+          "content": "fc75f0c42fa63227c8505d5a024a4876c3dd60f354d96011b05fa61ac0adb0c9"
         }
       ]
     },
@@ -173,13 +173,61 @@
     },
     {
       "type": "file",
+      "bom-ref": "file:ews/src/CalendarOccurrenceId.php",
+      "name": "ews/src/CalendarOccurrenceId.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2211f9b6e7cc69e029a3fe1fd0fab91cf201a072e9838c2ae38d3904127e95e8"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/CalendarOccurrenceResolver.php",
+      "name": "ews/src/CalendarOccurrenceResolver.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "627ea0615d98c1fa6318b83db4e56ad9512efab80ab21af7dd64cf7481a06068"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/CalendarViewOperation.php",
+      "name": "ews/src/CalendarViewOperation.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "605c8c1f62c81853a6b98bada64523c839f65eb7bb9ac07dd81b589a19ca6c07"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:ews/src/CalendarViewQuery.php",
+      "name": "ews/src/CalendarViewQuery.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9e04cf9a74a7554d0e741148f40305ac12d80478da6730d88fee287236831817"
+        }
+      ]
+    },
+    {
+      "type": "file",
       "bom-ref": "file:ews/src/Converter.php",
       "name": "ews/src/Converter.php",
       "description": "Repository source file.",
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "fcbaabf739c49a5e47ce417180cac1da1df07b7411cda4ad0d0e41232182ec3c"
+          "content": "8beeb0d4605107ac3c98604755fbb0f9acd7d0d51b75f99c94ce5827cfe909df"
         }
       ]
     },
@@ -191,7 +239,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "e53d62e76d9d9c1b16ce0cd9c6df9484029169ea04c4832d1e63147ca5eec5ba"
+          "content": "9ccda6d9727bf612d007649dd76a7391aed721ac93c519bd05254e383b92886f"
         }
       ]
     },
@@ -299,7 +347,43 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "f2ae14d3d8499e8cb57bf54dd4795c871d013f0f38e58d278d59b15faaa0b7ed"
+          "content": "23e8e0d90dda83a955e508a3cc4661be3c52e546ee1acb9662a1856235437e09"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/calendar_occurrence_conversion.php",
+      "name": "tests/calendar_occurrence_conversion.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c48593994cb44a6546051fb16857188b8ae6b996f0de49cee8ade43208a0f861"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/calendar_occurrence_id.php",
+      "name": "tests/calendar_occurrence_id.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d0475dd9adac76e0961d6926b7dc50d4e01b5b2a6966f60e821310cf491828b2"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/calendar_occurrence_resolver.php",
+      "name": "tests/calendar_occurrence_resolver.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "661aad5c2960f1a59a64a99af2401b923229209343754568ac89a9f11ffb6b4f"
         }
       ]
     },
@@ -311,7 +395,55 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "696da33887b7b86297947599485d5f5d6fd3d806ac1dc534c3db5520158a167e"
+          "content": "8cd69ff88db7b18d458a87606585897a1e7de7c0a9d7557ca70920e3d4fbda49"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/calendar_view_operation.php",
+      "name": "tests/calendar_view_operation.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2a8896247b8fde6962d8d8892ca0b0d025f62d8427e3925881e4d0ac3e791685"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/calendar_view_query.php",
+      "name": "tests/calendar_view_query.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2998eff0127d6a1ad5f7547eb672fe13784db683306a0f6e2271fb52bd8929f4"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/calendar_view_wiring.php",
+      "name": "tests/calendar_view_wiring.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "434d0612728abf895befa073121b9018b2397f77380ea5dae97fda649269c590"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/calendar_write_response.php",
+      "name": "tests/calendar_write_response.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "55374314bdfac5402dd55dd02cf1042d11bb77cde1264ff130c42da3402c6980"
         }
       ]
     },
@@ -401,6 +533,18 @@
     },
     {
       "type": "file",
+      "bom-ref": "file:tests/live_calendar_view.py",
+      "name": "tests/live_calendar_view.py",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0440574b45e3b057642753f87e82efcb0f82f2d6b8956d9b55f87622d91d8674"
+        }
+      ]
+    },
+    {
+      "type": "file",
       "bom-ref": "file:tests/live_ews.py",
       "name": "tests/live_ews.py",
       "description": "Repository source file.",
@@ -444,6 +588,18 @@
         {
           "alg": "SHA-256",
           "content": "64f312c632d1b1e271948f501d73abeffae0ee362828fe8cd5838c256dcfe42c"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "file:tests/sync_calendar_read.php",
+      "name": "tests/sync_calendar_read.php",
+      "description": "Repository source file.",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "bc101e15cf48f2f2aeb7d710625851461f23587ede0530a639a5b88a71aa5391"
         }
       ]
     },
@@ -516,6 +672,10 @@
         "file:ews/compat.php",
         "file:ews/public/index.php",
         "file:ews/run.php",
+        "file:ews/src/CalendarOccurrenceId.php",
+        "file:ews/src/CalendarOccurrenceResolver.php",
+        "file:ews/src/CalendarViewOperation.php",
+        "file:ews/src/CalendarViewQuery.php",
         "file:ews/src/Converter.php",
         "file:ews/src/Operations.php",
         "file:ews/src/Server.php",
@@ -557,7 +717,14 @@
         "bridge",
         "curl-cli",
         "file:tests/calendar_conversion.php",
+        "file:tests/calendar_occurrence_conversion.php",
+        "file:tests/calendar_occurrence_id.php",
+        "file:tests/calendar_occurrence_resolver.php",
         "file:tests/calendar_safety.php",
+        "file:tests/calendar_view_operation.php",
+        "file:tests/calendar_view_query.php",
+        "file:tests/calendar_view_wiring.php",
+        "file:tests/calendar_write_response.php",
         "file:tests/capability_accounts.php",
         "file:tests/contact_converter.php",
         "file:tests/contact_indexed_update.php",
@@ -565,10 +732,12 @@
         "file:tests/contact_update.php",
         "file:tests/converter_versions.php",
         "file:tests/getitem_versions.php",
+        "file:tests/live_calendar_view.py",
         "file:tests/live_ews.py",
         "file:tests/sqlite_sync_store.php",
         "file:tests/sync_active_state.php",
         "file:tests/sync_bootstrap.php",
+        "file:tests/sync_calendar_read.php",
         "file:tests/sync_generation.php",
         "file:tests/sync_items.php",
         "file:tests/sync_sqlite_integration.php",

@@ -270,9 +270,10 @@ class EwsOperations {
     private function syncItemXml(DOMDocument $dom, string $type, string $folder, string $id, mixed $record, string $shape): string {
         if (!is_array($record) || !is_array($record['object'] ?? null) || !is_string($record['changeKey'] ?? null) ||
             !hash_equals($record['changeKey'], EwsConverter::itemChangeKey($record['object']))) throw new RuntimeException('Stored item version mismatch');
-        if ($type === 'calendar') EwsConverter::safeCalendarTimes($record['object']);
         $tag = match ($type) { 'contacts' => 'Contact', 'calendar' => 'CalendarItem', default => 'Message' };
-        if ($shape === 'IdOnly') return '<t:' . $tag . '>' . EwsSoap::buildId($dom, $id, $record['changeKey']) . '</t:' . $tag . '>';
+        // Calendar IdOnly must still pass the complete read conversion, including
+        // XML validation, rather than the unrelated and stricter write guard.
+        if ($shape === 'IdOnly' && $type !== 'calendar') return '<t:' . $tag . '>' . EwsSoap::buildId($dom, $id, $record['changeKey']) . '</t:' . $tag . '>';
         $xml = match ($type) {
             'contacts' => EwsConverter::contactToXml($dom, $record['object'], $folder),
             'calendar' => EwsConverter::calendarToXml($dom, $record['object'], $folder),
@@ -292,6 +293,7 @@ class EwsOperations {
             if (in_array($child->localName, ['Body', 'Attachments'], true)) $remove[] = $child;
         }
         if (!$itemId) throw new RuntimeException('Missing converted item ID');
+        if ($shape === 'IdOnly') return '<t:' . $tag . '>' . EwsSoap::buildId($dom, $id, $record['changeKey']) . '</t:' . $tag . '>';
         $itemId->setAttribute('Id', $id); $itemId->setAttribute('ChangeKey', $record['changeKey']);
         foreach ($remove as $child) $item->removeChild($child);
         return $wrapper->saveXML($item);
@@ -400,14 +402,17 @@ class EwsOperations {
             $expected = array_fill_keys(array_map(fn($id) => 'i' . base64_encode($id), $chunk), true);
             foreach ($r['list'] as $object) {
                 if (!is_array($object) || !isset($object['id']) || !is_string($object['id'])) throw new RuntimeException('Invalid JMAP object');
-                if ($type === 'calendar') EwsConverter::safeCalendarTimes($object);
                 unset($object['bodyValues']);
                 $key = 'i' . base64_encode($object['id']);
                 if (!isset($expected[$key]) || isset($objects[$key])) throw new RuntimeException('Unexpected JMAP object');
                 $encoded = json_encode(self::syncCanonical($object), JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
                 $bytes += strlen($encoded);
                 if (strlen($encoded) > 1048576 || $bytes > 33554432) throw new RuntimeException('Sync object size limit exceeded');
-                $hashes[$key] = EwsConverter::itemChangeKey($object); $objects[$key] = $object;
+                $hash = EwsConverter::itemChangeKey($object);
+                // Validate every calendar item before publishing any snapshot,
+                // regardless of the requested shape or which page contains it.
+                if ($type === 'calendar') $this->syncItemXml(new DOMDocument(), $type, EwsConverter::PFX_CALENDAR . $folder, EwsConverter::PFX_CALENDAR . $object['id'], ['object' => $object, 'changeKey' => $hash], 'Default');
+                $hashes[$key] = $hash; $objects[$key] = $object;
             }
         }
         [$verifyIds, $verifyState] = $this->syncQuery($type, $folder, $account, $using);
@@ -561,6 +566,9 @@ class EwsOperations {
 
     public function findItem(DOMElement $request): string {
         try {
+            if (EwsSoap::getFirstChild($request, 'CalendarView', EwsSoap::NS_M)) {
+                return (new EwsCalendarViewOperation($this->client))->findItem($request);
+            }
             if ($request->getElementsByTagNameNS(EwsSoap::NS_M, 'CalendarView')->length || $request->getElementsByTagNameNS(EwsSoap::NS_T, 'CalendarView')->length) {
                 return $this->errorResponse('FindItem', 'ErrorInvalidOperation', 'CalendarView is not supported');
             }
@@ -643,6 +651,7 @@ class EwsOperations {
             $this->rejectOccurrenceIds($request);
             $itemShape = EwsSoap::getFirstChild($request, 'ItemShape');
             $wantMime = false;
+            $baseShape = $itemShape ? EwsSoap::getChildValue($itemShape, 'BaseShape') : 'Default';
             if ($itemShape) {
                 $furi = $itemShape->getElementsByTagNameNS(EwsSoap::NS_T, 'FieldURI');
                 for ($i = 0; $i < $furi->length; $i++) {
@@ -672,7 +681,10 @@ class EwsOperations {
             $calendarIds = [];
 
             foreach ($ids as $id) {
-                if (str_starts_with($id, EwsConverter::PFX_CONTACTS)) {
+                if (str_starts_with($id, 'ewsocc_')) {
+                    // Occurrence IDs are untrusted and are never JMAP mail IDs.
+                    continue;
+                } elseif (str_starts_with($id, EwsConverter::PFX_CONTACTS)) {
                     $contactIds[] = substr($id, strlen(EwsConverter::PFX_CONTACTS));
                 } elseif (str_starts_with($id, EwsConverter::PFX_CALENDAR)) {
                     $calendarIds[] = substr($id, strlen(EwsConverter::PFX_CALENDAR));
@@ -685,8 +697,10 @@ class EwsOperations {
             $emailsByJmapId = [];
             $contactsByJmapId = [];
             $calendarsByJmapId = [];
+            $mailFailed = $contactsFailed = $calendarFailed = false;
 
             if ($mailIds) {
+                try {
                 $r = $this->client->call([
                     ['Email/get', [
                         'accountId'          => $this->accountId,
@@ -696,12 +710,15 @@ class EwsOperations {
                         'fetchAllBodyValues' => true,
                     ], '0'],
                 ]);
+                if (($r[0][0] ?? null) !== 'Email/get' || !is_array($r[0][1]['list'] ?? null)) throw new RuntimeException('Email get failed');
                 foreach ($r[0][1]['list'] ?? [] as $email) {
                     $emailsByJmapId[$email['id']] = $email;
                 }
+                } catch (\Throwable $e) { $mailFailed = true; }
             }
 
             if ($contactIds) {
+                try {
                 $r = $this->client->call([
                     ['ContactCard/get', [
                         'accountId'  => $this->contactsAccountId,
@@ -709,12 +726,15 @@ class EwsOperations {
                         'properties' => null,
                     ], '0'],
                 ], [JmapClient::CAP_CORE, JmapClient::CAP_CONTACTS]);
+                if (($r[0][0] ?? null) !== 'ContactCard/get' || !is_array($r[0][1]['list'] ?? null)) throw new RuntimeException('Contact get failed');
                 foreach ($r[0][1]['list'] ?? [] as $card) {
                     $contactsByJmapId[$card['id']] = $card;
                 }
+                } catch (\Throwable $e) { $contactsFailed = true; }
             }
 
             if ($calendarIds) {
+                try {
                 $r = $this->client->call([
                     ['CalendarEvent/get', [
                         'accountId'  => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
@@ -722,17 +742,46 @@ class EwsOperations {
                         'properties' => null,
                     ], '0'],
                 ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
+                if (($r[0][0] ?? null) !== 'CalendarEvent/get' || !is_array($r[0][1]['list'] ?? null)) throw new RuntimeException('Calendar get failed');
                 foreach ($r[0][1]['list'] ?? [] as $event) {
                     $calendarsByJmapId[$event['id']] = $event;
                 }
+                } catch (\Throwable $e) { $calendarFailed = true; }
             }
 
             $responsesXml = '';
             foreach ($ids as $id) {
-                if (str_starts_with($id, EwsConverter::PFX_CONTACTS)) {
+                if (str_starts_with($id, 'ewsocc_')) {
+                    try {
+                        try {
+                            $resolved = (new EwsCalendarOccurrenceResolver($this->client))->resolve($id);
+                        } catch (EwsCalendarOccurrenceNotFound $e) {
+                            $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Error"><m:ResponseCode>ErrorItemNotFound</m:ResponseCode></m:GetItemResponseMessage>';
+                            continue;
+                        }
+                        // The resolver pins and refreshes the caller's session and
+                        // returns the authorized calendar, not an account ID.
+                        $account = $this->client->getSession()['primaryAccounts'][JmapClient::CAP_CALENDARS] ?? null;
+                        if (!is_string($account) || $account === '') throw new RuntimeException('Calendar account unavailable');
+                        $xml = EwsConverter::calendarOccurrenceToXml($dom, $resolved['event'], $resolved['master'], $account, $id, EwsConverter::PFX_CALENDAR . $resolved['calendar']['id']);
+                        if ($baseShape === 'IdOnly') {
+                            $xml = '<t:CalendarItem>' . EwsSoap::buildId($dom, $id, EwsConverter::itemChangeKey($resolved['master'])) . '</t:CalendarItem>';
+                        }
+                        $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items>' . $xml . '</m:Items></m:GetItemResponseMessage>';
+                    } catch (\Throwable $e) {
+                        // Only the resolver's typed, revalidated absence is
+                        // distinguishable; other failures must remain concealed.
+                        $code = 'ErrorInternalServerError';
+                        try { EwsCalendarOccurrenceId::decode($id); }
+                        catch (InvalidArgumentException $ignored) { $code = 'ErrorInvalidIdMalformed'; }
+                        $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Error"><m:ResponseCode>' . $code . '</m:ResponseCode></m:GetItemResponseMessage>';
+                    }
+                } elseif (str_starts_with($id, EwsConverter::PFX_CONTACTS)) {
                     $jmapId = substr($id, strlen(EwsConverter::PFX_CONTACTS));
                     $card = $contactsByJmapId[$jmapId] ?? null;
-                    if (!$card) {
+                    if ($contactsFailed) {
+                        $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Error"><m:ResponseCode>ErrorInternalServerError</m:ResponseCode></m:GetItemResponseMessage>';
+                    } elseif (!$card) {
                         $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Error">' .
                             '<m:MessageText></m:MessageText><m:ResponseCode>ErrorItemNotFound</m:ResponseCode>' .
                             '</m:GetItemResponseMessage>';
@@ -745,7 +794,9 @@ class EwsOperations {
                 } elseif (str_starts_with($id, EwsConverter::PFX_CALENDAR)) {
                     $jmapId = substr($id, strlen(EwsConverter::PFX_CALENDAR));
                     $event = $calendarsByJmapId[$jmapId] ?? null;
-                    if (!$event) {
+                    if ($calendarFailed) {
+                        $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Error"><m:ResponseCode>ErrorInternalServerError</m:ResponseCode></m:GetItemResponseMessage>';
+                    } elseif (!$event) {
                         $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Error">' .
                             '<m:MessageText></m:MessageText><m:ResponseCode>ErrorItemNotFound</m:ResponseCode>' .
                             '</m:GetItemResponseMessage>';
@@ -757,7 +808,9 @@ class EwsOperations {
                     }
                 } else {
                     $email = $emailsByJmapId[$id] ?? null;
-                    if (!$email) {
+                    if ($mailFailed) {
+                        $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Error"><m:ResponseCode>ErrorInternalServerError</m:ResponseCode></m:GetItemResponseMessage>';
+                    } elseif (!$email) {
                         $responsesXml .= '<m:GetItemResponseMessage ResponseClass="Error">' .
                             '<m:MessageText></m:MessageText><m:ResponseCode>ErrorItemNotFound</m:ResponseCode>' .
                             '</m:GetItemResponseMessage>';
@@ -900,16 +953,7 @@ class EwsOperations {
                             : $this->getDefaultCalendarId(true);
                         if ($calId === null || $calId === '') throw new RuntimeException('No calendar available');
                         $event = EwsConverter::ewsEventToJmap($itemNode, $calId);
-                        $r = $this->client->call([
-                                ['CalendarEvent/set', [
-                                    'accountId' => $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS),
-                                    'create'    => ['ev1' => $event],
-                                ], '0'],
-                            ], [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS]);
-                        $created = $r[0][1]['created']['ev1'] ?? null;
-                        if (($r[0][0] ?? null) !== 'CalendarEvent/set' || !is_string($created['id'] ?? null) || $created['id'] === '') throw new RuntimeException('Calendar create failed');
-                        $itemsXml .= EwsSoap::buildId($dom, EwsConverter::PFX_CALENDAR . $created['id']);
-                        break;
+                        return $this->createCalendarEvent($event);
                 }
             }
 
@@ -942,7 +986,7 @@ class EwsOperations {
                 return $this->errorResponse('UpdateItem', 'ErrorInvalidRequest', 'Missing ItemChanges');
             }
 
-            $this->rejectOccurrenceIds($request);
+            $this->rejectOccurrenceIds($request, true);
             $allChanges = $itemChanges->getElementsByTagNameNS(EwsSoap::NS_T, 'ItemChange');
             $hasCalendar = false;
             foreach ($allChanges as $change) {
@@ -957,7 +1001,8 @@ class EwsOperations {
                 if (count($requestChildren) !== 1 || $requestChildren[0] !== $itemChanges || $itemChanges->namespaceURI !== EwsSoap::NS_M) throw new EwsCalendarSafetyException('Unsupported calendar update option');
                 foreach ($request->attributes as $attribute) {
                     if ($attribute->namespaceURI === 'http://www.w3.org/2000/xmlns/') continue;
-                    if ($attribute->namespaceURI || $attribute->localName !== 'SendMeetingInvitationsOrCancellations' || $attribute->value !== 'SendToNone') throw new EwsCalendarSafetyException('Unsupported calendar update option');
+                    if ($attribute->namespaceURI || !(($attribute->localName === 'SendMeetingInvitationsOrCancellations' && $attribute->value === 'SendToNone') ||
+                        ($attribute->localName === 'ConflictResolution' && in_array($attribute->value, ['NeverOverwrite', 'AutoResolve'], true)))) throw new EwsCalendarSafetyException('Unsupported calendar update option');
                 }
                 $changeChildren = [];
                 foreach ($allChanges->item(0)->childNodes as $child) if ($child instanceof DOMElement) $changeChildren[] = $child;
@@ -1016,7 +1061,7 @@ class EwsOperations {
 
     public function deleteItem(DOMElement $request): string {
         try {
-            $this->rejectOccurrenceIds($request);
+            $this->rejectOccurrenceIds($request, true);
             $deleteType = EwsSoap::getChildValue($request, 'DeleteType');
             $isHardDelete = strtolower($deleteType) === 'harddelete';
 
@@ -1129,6 +1174,7 @@ class EwsOperations {
 
     public function sendItem(DOMElement $request): string {
         try {
+            $this->rejectOccurrenceIds($request, true);
             $savedFolderId = $this->resolveFolderIdFromEl(EwsSoap::getFirstChild($request, 'SavedItemFolderId'));
 
             $itemIdsEl = EwsSoap::getFirstChild($request, 'ItemIds');
@@ -1136,6 +1182,15 @@ class EwsOperations {
 
             if (!$idEls || $idEls->length === 0) {
                 return $this->errorResponse('SendItem', 'ErrorInvalidRequest', 'Missing ItemIds');
+            }
+
+            // Validate the entire batch before sending any message.
+            foreach ($idEls as $itemId) {
+                $id = $itemId->getAttribute('Id');
+                if ($id === '' || str_starts_with($id, EwsConverter::PFX_CONTACTS) ||
+                    str_starts_with($id, EwsConverter::PFX_CALENDAR)) {
+                    return $this->errorResponse('SendItem', 'ErrorInvalidOperation', 'Only mail items can be sent');
+                }
             }
 
             $success = true;
@@ -1218,6 +1273,8 @@ class EwsOperations {
 
             return EwsSoap::buildSoapResponse($bodyXml);
 
+        } catch (EwsCalendarSafetyException $e) {
+            return $this->errorResponse('SendItem', 'ErrorInvalidOperation', $e->getMessage());
         } catch (\Throwable $e) {
             return $this->errorResponse('SendItem', 'ErrorInternalServerError', $e->getMessage());
         }
@@ -2339,11 +2396,14 @@ class EwsOperations {
         return $result;
     }
 
-    private function rejectOccurrenceIds(DOMElement $request): void {
+    private function rejectOccurrenceIds(DOMElement $request, bool $rejectEncoded = false): void {
         foreach (['OccurrenceItemId', 'RecurringMasterItemId', 'RecurringMasterItemIdRanges'] as $name) {
             if ($request->getElementsByTagNameNS(EwsSoap::NS_T, $name)->length) {
                 throw new EwsCalendarSafetyException('Calendar occurrence and master IDs are not supported');
             }
+        }
+        if ($rejectEncoded) foreach ($request->getElementsByTagNameNS(EwsSoap::NS_T, 'ItemId') as $itemId) {
+            if (str_starts_with($itemId->getAttribute('Id'), 'ewsocc_')) throw new EwsCalendarSafetyException('Calendar occurrence writes are not supported');
         }
     }
 
@@ -2377,26 +2437,102 @@ class EwsOperations {
         return $patch;
     }
 
+    /** Read the default object projection used by GetItem and SyncFolderItems. */
+    private function calendarWriteRead(string $id, string $account, array $using): array {
+        $r = $this->client->call([['CalendarEvent/get', ['accountId' => $account, 'ids' => [$id], 'properties' => null], '0']], $using);
+        $data = $r[0][1] ?? null;
+        if (count($r) !== 1 || ($r[0][0] ?? null) !== 'CalendarEvent/get' || ($r[0][2] ?? null) !== '0' || !is_array($data) ||
+            ($data['accountId'] ?? null) !== $account || !is_string($data['state'] ?? null) || $data['state'] === '' ||
+            !is_array($data['list'] ?? null) || !array_is_list($data['list']) || count($data['list']) !== 1 ||
+            !is_array($data['list'][0]) || ($data['list'][0]['id'] ?? null) !== $id || ($data['notFound'] ?? null) !== []) {
+            throw new RuntimeException('Invalid calendar read');
+        }
+        return $data;
+    }
+
+    private function calendarWriteError(string $operation, string $code, string $message): string {
+        return '<m:' . $operation . 'ResponseMessage ResponseClass="Error"><m:MessageText>' . EwsSoap::escapeXml($message) .
+            '</m:MessageText><m:ResponseCode>' . $code . '</m:ResponseCode></m:' . $operation . 'ResponseMessage>';
+    }
+
+    private function calendarWriteSuccess(string $operation, string $id, array $event): string {
+        return '<m:' . $operation . 'ResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:CalendarItem>' .
+            EwsSoap::buildId(new DOMDocument(), EwsConverter::PFX_CALENDAR . $id, EwsConverter::itemChangeKey($event)) .
+            '</t:CalendarItem></m:Items></m:' . $operation . 'ResponseMessage>';
+    }
+
+    private function createCalendarEvent(array $event): string {
+        $account = $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS);
+        $using = [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS];
+        try {
+            $r = $this->client->call([['CalendarEvent/set', ['accountId' => $account, 'create' => ['ev1' => $event]], '0']], $using);
+            $result = $r[0][1] ?? null;
+            if (count($r) !== 1 || ($r[0][0] ?? null) !== 'CalendarEvent/set' || ($r[0][2] ?? null) !== '0' || !is_array($result) ||
+                ($result['accountId'] ?? null) !== $account || !is_string($result['newState'] ?? null) || $result['newState'] === '' ||
+                !is_array($result['created'] ?? null) || count($result['created']) !== 1 || !is_array($result['created']['ev1'] ?? null) ||
+                !is_string($result['created']['ev1']['id'] ?? null) || strlen($result['created']['ev1']['id']) > 1024 ||
+                preg_match('/^[\x{20}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]+$/uD', $result['created']['ev1']['id']) !== 1 ||
+                !in_array($result['notCreated'] ?? null, [null, []], true)) throw new RuntimeException('Invalid calendar set');
+            $id = $result['created']['ev1']['id'];
+            $after = $this->calendarWriteRead($id, $account, $using);
+            if ($after['state'] !== $result['newState'] || ($after['list'][0]['uid'] ?? null) !== $event['uid'] ||
+                ($after['list'][0]['calendarIds'] ?? null) !== $event['calendarIds']) throw new RuntimeException('Calendar result changed');
+            EwsConverter::safeCalendarTimes($after['list'][0]);
+            $message = $this->calendarWriteSuccess('CreateItem', $id, $after['list'][0]);
+        } catch (\Throwable $e) {
+            // A failed or malformed response can follow a successful write: never retry or invent an ID.
+            $message = $this->calendarWriteError('CreateItem', 'ErrorInternalServerError', 'Calendar create outcome could not be determined');
+        }
+        return EwsSoap::buildSoapResponse('<m:CreateItemResponse><m:ResponseMessages>' . $message . '</m:ResponseMessages></m:CreateItemResponse>');
+    }
+
     private function updateCalendarEvent(string $id, DOMElement $updates, string $changeKey): string {
         $jmapId = $this->jmapId($id);
         $patch = $this->calendarUpdatePatch($updates);
+        if ($jmapId === '') return $this->calendarWriteError('UpdateItem', 'ErrorInvalidIdMalformed', 'Invalid calendar item ID');
+        // AutoResolve is deliberately as conservative as NeverOverwrite: without
+        // a matching version there is no safe basis for merging this update.
+        if ($changeKey === '') return $this->calendarWriteError('UpdateItem', 'ErrorChangeKeyRequired', 'Calendar change key is required');
         $account = $this->client->getCapabilityAccountId(JmapClient::CAP_CALENDARS);
         $using = [JmapClient::CAP_CORE, JmapClient::CAP_CALENDARS];
-        $r = $this->client->call([['CalendarEvent/get', ['accountId' => $account, 'ids' => [$jmapId], 'properties' => null], '0']], $using);
-        $data = $r[0][1] ?? null;
-        if (($r[0][0] ?? null) !== 'CalendarEvent/get' || ($r[0][2] ?? null) !== '0' || !is_array($data) ||
-            ($data['accountId'] ?? null) !== $account || !is_string($data['state'] ?? null) || $data['state'] === '' ||
-            !is_array($data['list'] ?? null) || count($data['list']) !== 1 || ($data['list'][0]['id'] ?? null) !== $jmapId || ($data['notFound'] ?? null) !== []) {
-            throw new RuntimeException('Calendar read failed');
-        }
+        try { $data = $this->calendarWriteRead($jmapId, $account, $using); }
+        catch (\Throwable $e) { return $this->calendarWriteError('UpdateItem', 'ErrorInternalServerError', 'Calendar read failed'); }
         EwsConverter::safeCalendarTimes($data['list'][0]);
-        if ($changeKey !== '' && !hash_equals(EwsConverter::itemChangeKey($data['list'][0]), $changeKey)) return $this->contactUpdateError('ErrorIrresolvableConflict', 'Calendar item changed');
-        $r = $this->client->call([['CalendarEvent/set', ['accountId' => $account, 'ifInState' => $data['state'], 'update' => [$jmapId => $patch]], '0']], $using);
-        $result = $r[0][1] ?? [];
-        if (($r[0][0] ?? null) === 'error' && ($result['type'] ?? '') === 'stateMismatch') return $this->contactUpdateError('ErrorIrresolvableConflict', 'Calendar changed during update');
-        if (($r[0][0] ?? null) !== 'CalendarEvent/set' || !is_array($result['updated'] ?? null) || !array_key_exists($jmapId, $result['updated'])) return $this->contactUpdateError('ErrorInternalServerError', 'Calendar update failed');
-        return '<m:ItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode>' .
-            EwsSoap::buildId(new DOMDocument(), $id, $jmapId) . '</m:ItemResponseMessage>';
+        foreach (['participants', 'organizerCalendarAddress', 'replyTo', 'schedulingLinks'] as $field) {
+            $value = $data['list'][0][$field] ?? null;
+            if ($value !== null && $value !== [] && !($value instanceof stdClass && get_object_vars($value) === [])) {
+                throw new EwsCalendarSafetyException('Calendar scheduling updates are not supported');
+            }
+        }
+        if (!hash_equals(EwsConverter::itemChangeKey($data['list'][0]), $changeKey)) return $this->calendarWriteError('UpdateItem', 'ErrorIrresolvableConflict', 'Calendar item changed');
+        try {
+            $r = $this->client->call([['CalendarEvent/set', ['accountId' => $account, 'ifInState' => $data['state'], 'update' => [$jmapId => $patch]], '0']], $using);
+            $result = $r[0][1] ?? null;
+            if (count($r) === 1 && ($r[0][0] ?? null) === 'error' && ($r[0][2] ?? null) === '0' && is_array($result) && ($result['type'] ?? null) === 'stateMismatch') {
+                return $this->calendarWriteError('UpdateItem', 'ErrorIrresolvableConflict', 'Calendar changed during update');
+            }
+            if (count($r) === 1 && ($r[0][0] ?? null) === 'CalendarEvent/set' && ($r[0][2] ?? null) === '0' && is_array($result) &&
+                ($result['accountId'] ?? null) === $account && ($result['oldState'] ?? null) === $data['state'] &&
+                in_array($result['updated'] ?? null, [null, []], true) && is_array($result['notUpdated'] ?? null) &&
+                count($result['notUpdated']) === 1 && in_array($result['notUpdated'][$jmapId]['type'] ?? null, ['stateMismatch', 'conflict'], true)) {
+                return $this->calendarWriteError('UpdateItem', 'ErrorIrresolvableConflict', 'Calendar changed during update');
+            }
+            if (count($r) !== 1 || ($r[0][0] ?? null) !== 'CalendarEvent/set' || ($r[0][2] ?? null) !== '0' || !is_array($result) ||
+                ($result['accountId'] ?? null) !== $account || ($result['oldState'] ?? null) !== $data['state'] ||
+                !is_string($result['newState'] ?? null) || $result['newState'] === '' || !is_array($result['updated'] ?? null) ||
+                count($result['updated']) !== 1 || !array_key_exists($jmapId, $result['updated']) ||
+                !in_array($result['notUpdated'] ?? null, [null, []], true)) throw new RuntimeException('Invalid calendar set');
+            $updated = $result['updated'][$jmapId];
+            if ($updated !== null && !is_array($updated) && !($updated instanceof stdClass)) throw new RuntimeException('Invalid updated object');
+            $after = $this->calendarWriteRead($jmapId, $account, $using);
+            if ($after['state'] !== $result['newState'] || ($after['list'][0]['title'] ?? null) !== $patch['title']) {
+                return $this->calendarWriteError('UpdateItem', 'ErrorIrresolvableConflict', 'Calendar update outcome could not be determined');
+            }
+            EwsConverter::safeCalendarTimes($after['list'][0]);
+            return $this->calendarWriteSuccess('UpdateItem', $jmapId, $after['list'][0]);
+        } catch (\Throwable $e) {
+            return $this->calendarWriteError('UpdateItem', 'ErrorInternalServerError', 'Calendar update outcome could not be determined');
+        }
     }
 
     private function updateEmail(string $id, DOMElement $updates): string {

@@ -6,11 +6,12 @@ require_once __DIR__ . '/../jmap/jmap_calendar.php';
 
 class CalendarSafetyClient extends JmapClient {
     public array $calls = [];
+    public string $principal = 'principal';
     public array $event = ['id' => 'e1', 'title' => 'UTC', 'start' => '2032-01-02T10:00:00', 'timeZone' => 'UTC', 'duration' => 'PT1H'];
     public function __construct() {}
     public function getAccountId(): string { return 'account'; }
     public function getCapabilityAccountId(string $capability): string { return 'account'; }
-    public function getSession(): array { return ['username' => 'principal']; }
+    public function getSession(): array { return ['username' => $this->principal]; }
     public function getApiUrl(): string { return 'https://example.test/jmap'; }
     public function call(array $methodCalls, array $using = [self::CAP_CORE, self::CAP_MAIL]): array {
         [$method, $args, $tag] = $methodCalls[0];
@@ -60,12 +61,27 @@ $unsafe = [
 ];
 try {
     foreach ([['timeZone' => 'Europe/Amsterdam'], ['recurrenceRule' => ['@type' => 'RecurrenceRule', 'frequency' => 'weekly', 'interval' => 1]]] as $change) {
-        $client = new CalendarSafetyClient(); $client->event = array_replace($client->event, $change); $ops = new EwsOperations($client);
+        $client = new CalendarSafetyClient(); $client->event = array_replace($client->event, $change);
+        // Keep snapshots isolated: the fake client's JMAP state/queryState are constant.
+        $client->principal = isset($change['recurrenceRule']) ? 'supported-weekly' : 'supported-amsterdam';
+        $ops = new EwsOperations($client);
         $converted = EwsConverter::calendarToXml($dom, $client->event, null);
         checkCalendar(str_contains($converted, isset($change['recurrenceRule']) ? '<t:CalendarItemType>RecurringMaster</t:CalendarItemType>' : 'W. Europe Standard Time'), 'supported read conversion');
         expectCalendar($ops->getItem(calendarRequest('GetItem', '<m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:ItemIds><t:ItemId Id="cal_e1"/></m:ItemIds>')), 'NoError');
-        // Sync still has its independent, intentionally stricter guard.
-        expectCalendar($ops->syncFolderItems(calendarRequest('SyncFolderItems', '<m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:SyncFolderId><t:FolderId Id="cal_calendar"/></m:SyncFolderId><m:MaxChangesReturned>1</m:MaxChangesReturned>')), 'ErrorInvalidOperation');
+        foreach (['IdOnly', 'Default'] as $shape) {
+            $sync = $ops->syncFolderItems(calendarRequest('SyncFolderItems', '<m:ItemShape><t:BaseShape>' . $shape . '</t:BaseShape></m:ItemShape><m:SyncFolderId><t:FolderId Id="cal_calendar"/></m:SyncFolderId><m:MaxChangesReturned>1</m:MaxChangesReturned>'));
+            expectCalendar($sync, 'NoError');
+            $syncDoc = new DOMDocument(); checkCalendar($syncDoc->loadXML($sync), 'supported sync XML');
+            $xpath = new DOMXPath($syncDoc); $xpath->registerNamespace('t', EwsSoap::NS_T);
+            $syncItems = $xpath->query('//t:Create/t:CalendarItem');
+            $syncId = $xpath->evaluate('string(//t:Create/t:CalendarItem/t:ItemId/@Id)');
+            $syncKey = $xpath->evaluate('string(//t:Create/t:CalendarItem/t:ItemId/@ChangeKey)');
+            checkCalendar($syncItems->length === 1 && $syncId === 'cal_e1' && $syncKey === EwsConverter::itemChangeKey($client->event), 'supported sync item and change key: ' . json_encode([$shape, $syncItems->length, $syncId, $syncKey, EwsConverter::itemChangeKey($client->event)]));
+            if ($shape === 'Default') {
+                checkCalendar($xpath->evaluate('string(//t:Create/t:CalendarItem/t:CalendarItemType)') === (isset($change['recurrenceRule']) ? 'RecurringMaster' : 'Single'), 'supported sync item type');
+                checkCalendar($xpath->evaluate('string(//t:Create/t:CalendarItem/t:Start)') === (isset($change['timeZone']) ? '2032-01-02T09:00:00Z' : '2032-01-02T10:00:00Z'), 'supported sync item start');
+            }
+        }
         noWrites($client);
     }
     foreach ($unsafe as $change) {

@@ -342,6 +342,10 @@ class EwsConverter {
 
     public static function calendarToXml(DOMDocument $dom, array $event, ?string $folderId): string {
         if (array_key_exists('status', $event) && $event['status'] !== null && $event['status'] !== 'confirmed') throw new EwsCalendarSafetyException('Unsupported calendar event status');
+        // Calendar/get defaults are not supplied here; never guess an effective reminder.
+        $useDefaultAlerts = $event['useDefaultAlerts'] ?? null;
+        if ($useDefaultAlerts === true) throw new EwsCalendarSafetyException('Calendar default alerts are not available');
+        if ($useDefaultAlerts !== null && $useDefaultAlerts !== false) throw new EwsCalendarSafetyException('Invalid calendar default alerts flag');
         [$startTs, $endTs, $zoneId, $allDay] = self::calendarReadTimes($event);
         $recurrence = self::calendarRecurrenceXml($event, $startTs, $endTs, $allDay);
         $id        = $event['id'] ?? '';
@@ -416,6 +420,110 @@ class EwsConverter {
 
         $xml .= '</t:CalendarItem>';
         return $xml;
+    }
+
+    /**
+     * Convert a server-expanded instance, not an occurrence-index lookup.
+     * Caller must authenticate/authorize the account and fetch the complete
+     * master and expanded instance from a consistent JMAP state. The ID codec
+     * is not an authorization mechanism and must be loaded by the caller.
+     */
+    public static function calendarOccurrenceToXml(DOMDocument $dom, array $event, array $master, string $accountId, string $occurrenceId, ?string $folderId): string {
+        if (!class_exists('EwsCalendarOccurrenceId')) throw new EwsCalendarSafetyException('Occurrence ID codec is not loaded');
+        try { $identity = EwsCalendarOccurrenceId::decodeForAccount($occurrenceId, $accountId); }
+        catch (InvalidArgumentException $e) { throw new EwsCalendarSafetyException('Invalid occurrence identity', 0, $e); }
+        $base = $master['id'] ?? null;
+        $recurrenceId = $event['recurrenceId'] ?? null;
+        if (!is_string($base) || $base === '' || ($event['baseEventId'] ?? null) !== $base || $identity['baseEventId'] !== $base || !is_string($recurrenceId) || $identity['recurrenceId'] !== $recurrenceId) throw new EwsCalendarSafetyException('Occurrence identity does not match master');
+        if (!is_string($event['id'] ?? null) || $event['id'] === '' || $event['id'] === $base) throw new EwsCalendarSafetyException('Missing synthetic occurrence ID');
+        if (!is_string($master['uid'] ?? null) || $master['uid'] === '' || ($event['uid'] ?? null) !== $master['uid']) throw new EwsCalendarSafetyException('Occurrence UID does not match master');
+        self::utcTime($recurrenceId, false);
+        if (isset($event['recurrenceIdTimeZone']) && $event['recurrenceIdTimeZone'] !== ($master['timeZone'] ?? null)) throw new EwsCalendarSafetyException('Occurrence recurrence time zone does not match master');
+        if (array_key_exists('recurrenceRule', $event) && $event['recurrenceRule'] !== null) throw new EwsCalendarSafetyException('Expanded instance contains a recurrence rule');
+        foreach (['recurrenceRules', 'excludedRecurrenceRules', 'recurrenceOverrides'] as $key) {
+            $value = $event[$key] ?? null;
+            if ($value !== null && $value !== [] && !($value instanceof stdClass && get_object_vars($value) === [])) throw new EwsCalendarSafetyException('Expanded instance contains recurrence metadata');
+        }
+        $overrides = $master['recurrenceOverrides'] ?? [];
+        if ($overrides instanceof stdClass) $overrides = get_object_vars($overrides);
+        if (!is_array($overrides) || ($overrides && array_is_list($overrides))) throw new EwsCalendarSafetyException('Invalid recurrence overrides');
+        $masterForRule = $master;
+        unset($masterForRule['recurrenceOverrides']);
+        [$masterStart, $masterEnd, , $masterAllDay] = self::calendarReadTimes($masterForRule);
+        if (self::calendarRecurrenceXml($masterForRule, $masterStart, $masterEnd, $masterAllDay) === '') throw new EwsCalendarSafetyException('Occurrence master has no recurrence rule');
+        self::calendarCheckRuleMember($masterForRule, $recurrenceId);
+        $expectedStart = $recurrenceId;
+        $isException = false;
+        foreach ($overrides as $key => $patch) {
+            if (!is_string($key)) throw new EwsCalendarSafetyException('Invalid override recurrence ID');
+            self::utcTime($key, false);
+            if ($patch instanceof stdClass) $patch = get_object_vars($patch);
+            if (!is_array($patch) || ($patch && array_is_list($patch))) throw new EwsCalendarSafetyException('Invalid recurrence override');
+            if ($patch === ['excluded' => true]) {
+                if ($key === $recurrenceId) throw new EwsCalendarSafetyException('Excluded occurrence');
+                continue;
+            }
+            if ($patch === []) continue;
+            if (array_keys($patch) !== ['start'] || !is_string($patch['start'])) throw new EwsCalendarSafetyException('Unsupported recurrence override');
+            self::utcTime($patch['start'], false);
+            if ($key === $recurrenceId) {
+                $expectedStart = $patch['start'];
+                $isException = true;
+            }
+        }
+        if (($event['start'] ?? null) !== $expectedStart) throw new EwsCalendarSafetyException('Occurrence start does not match recurrence override');
+        // Compare all inherited properties rendered by calendarToXml. A partial
+        // or stale get must not silently replace master privacy or scheduling.
+        foreach (['uid', 'title', 'timeZone', 'endTimeZone', 'duration', 'showWithoutTime', 'status', 'privacy', 'freeBusyStatus', 'description', 'descriptionContentType', 'categories', 'useDefaultAlerts', 'alerts', 'locations', 'mainLocationId', 'participants', 'organizerCalendarAddress', 'calendarIds'] as $key) {
+            if (self::itemChangeKey(['v' => $event[$key] ?? null]) !== self::itemChangeKey(['v' => $master[$key] ?? null])) throw new EwsCalendarSafetyException('Occurrence differs from master: ' . $key);
+        }
+        $copy = $event;
+        unset($copy['baseEventId'], $copy['recurrenceId'], $copy['recurrenceIdTimeZone'], $copy['recurrenceRule'], $copy['recurrenceRules'], $copy['excludedRecurrenceRules'], $copy['recurrenceOverrides']);
+        [$startTs, $endTs] = self::calendarReadTimes($copy);
+        foreach (['utcStart' => $startTs, 'utcEnd' => $endTs] as $key => $expected) {
+            if (isset($event[$key]) && (!is_string($event[$key]) || self::utcTime($event[$key], true) !== $expected)) throw new EwsCalendarSafetyException('Occurrence UTC projection mismatch: ' . $key);
+        }
+        $xml = self::calendarToXml($dom, $copy, $folderId);
+        $xml = str_replace(EwsSoap::buildId($dom, self::PFX_CALENDAR . $copy['id'], self::itemChangeKey($copy)), EwsSoap::buildId($dom, $occurrenceId, self::itemChangeKey($master)), $xml, $idCount);
+        $xml = str_replace('<t:CalendarItemType>Single</t:CalendarItemType>', '<t:CalendarItemType>' . ($isException ? 'Exception' : 'Occurrence') . '</t:CalendarItemType>', $xml, $typeCount);
+        if ($idCount !== 1 || $typeCount !== 1) throw new EwsCalendarSafetyException('Invalid occurrence XML');
+        return $xml;
+    }
+
+    /** Membership in the restricted daily/weekly rule subset accepted above. */
+    private static function calendarCheckRuleMember(array $master, string $recurrenceId): void {
+        $start = $master['start'];
+        $startTs = self::utcTime($start, false);
+        $instanceTs = self::utcTime($recurrenceId, false);
+        if ($instanceTs < $startTs || substr($start, 11) !== substr($recurrenceId, 11)) throw new EwsCalendarSafetyException('Recurrence ID is not a rule occurrence');
+        $dayDiff = intdiv($instanceTs - $startTs, 86400);
+        $rule = $master['recurrenceRule'];
+        if ($rule instanceof stdClass) $rule = get_object_vars($rule);
+        $interval = $rule['interval'] ?? 1;
+        if ($rule['frequency'] === 'daily') {
+            if ($dayDiff % $interval !== 0) throw new EwsCalendarSafetyException('Recurrence ID is not a rule occurrence');
+            $ordinal = intdiv($dayDiff, $interval) + 1;
+        } else {
+            $names = ['mo', 'tu', 'we', 'th', 'fr', 'sa', 'su'];
+            $first = array_search($rule['firstDayOfWeek'] ?? 'mo', $names, true);
+            $startDay = (int)gmdate('N', $startTs) - 1;
+            $startPos = ($startDay - $first + 7) % 7;
+            $byDay = $rule['byDay'] ?? [['day' => $names[$startDay]]];
+            $positions = [];
+            foreach ($byDay as $day) {
+                if ($day instanceof stdClass) $day = get_object_vars($day);
+                $positions[] = (array_search($day['day'], $names, true) - $first + 7) % 7;
+            }
+            $week = intdiv($startPos + $dayDiff, 7);
+            $pos = ($startPos + $dayDiff) % 7;
+            if ($week % $interval !== 0 || !in_array($pos, $positions, true)) throw new EwsCalendarSafetyException('Recurrence ID is not a rule occurrence');
+            if ($week === 0) {
+                $ordinal = count(array_filter($positions, fn($p) => $p >= $startPos && $p <= $pos));
+            } else {
+                $ordinal = count(array_filter($positions, fn($p) => $p >= $startPos)) + (intdiv($week, $interval) - 1) * count($positions) + count(array_filter($positions, fn($p) => $p <= $pos));
+            }
+        }
+        if ((isset($rule['count']) && $ordinal > $rule['count']) || (isset($rule['until']) && $recurrenceId > $rule['until'])) throw new EwsCalendarSafetyException('Recurrence ID is outside rule range');
     }
 
     /** JSCalendar 2.0 organizer identity is an address, not a participant role. */

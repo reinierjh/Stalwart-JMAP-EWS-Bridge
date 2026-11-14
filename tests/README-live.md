@@ -50,3 +50,33 @@ uitsluitend het testaccount en verwijder alleen met zekerheid geïdentificeerde
 synthetische items. Mail-upload kan een tijdelijke, niet aan een item gekoppelde
 blob achterlaten; de server beheert de levensduur daarvan. Geen tijdelijke
 testscriptbestanden of credentials worden aangemaakt of verwijderd.
+
+## CalendarView en GetItem van voorkomens
+
+Gebruik `tests/live_calendar_view.py` samen met `tests/live_ews.py` in dezelfde
+map. Geef de goedgekeurde HTTPS JMAP-session en het credentialbestand expliciet
+op. De geadverteerde API-URL moet dezelfde hostname en equivalente HTTPS-poort
+hebben als de session-URL; credentials in URLs zijn verboden. Er worden geen
+redirects of proxies gebruikt. Start zelf eerst een geïsoleerde lokale
+EWS-stagingserver met een private state-map:
+
+```sh
+sudo python3 tests/live_calendar_view.py \
+  --jmap-session 'https://JMAP-HOST/jmap/session' \
+  --ews-url 'http://127.0.0.1:STAGING-PORT/EWS/Exchange.asmx' \
+  --ews-host 'EWS-VIRTUAL-HOST' \
+  --curl-config /root/.config/ews-bridge-test/curl.conf \
+  --confirm-test-account
+```
+
+Controleer de URL-pinning lokaal zonder netwerk met
+`python3 tests/live_calendar_view.py --self-test`.
+
+De test gebruikt één testagenda, één synthetische serie en één singleton,
+zonder deelnemers en met `sendSchedulingMessages=false`. De gebruikte vaste
+viewperiode mag geen andere items bevatten; anders faalt de exacte telling.
+Hij controleert DST, verplaatsing, uitsluiting, truncatie, grenswaarden,
+herhaalde IDs en alle door FindItem getoonde velden en volledige ChangeKeys
+tegen GetItem. Cleanup en beperkingen bij een verloren create-response of
+abrupte procesuitval zijn dezelfde als hierboven; alleen de twee aangemaakte
+master-/singleton-IDs worden verwijderd en op `notFound` gecontroleerd.

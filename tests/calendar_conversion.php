@@ -70,6 +70,12 @@ $x = convertCalendar(array_replace($base, ['locations' => ['other' => ['name' =>
 verifyCalendarConversion(val($x, 'Location') === 'Right', 'main location');
 $x = convertCalendar(array_replace($base, ['alerts' => ['a' => ['@type' => 'Alert', 'action' => 'display', 'trigger' => ['@type' => 'OffsetTrigger', 'offset' => '-PT15M']]]]));
 verifyCalendarConversion(val($x, 'ReminderIsSet') === 'true' && val($x, 'ReminderMinutesBeforeStart') === '15', 'reminder');
+foreach ([false, null] as $defaultFlag) {
+    $x = convertCalendar(array_replace($base, ['useDefaultAlerts' => $defaultFlag, 'alerts' => ['a' => ['action' => 'display', 'trigger' => ['@type' => 'OffsetTrigger', 'offset' => '-PT15M']]]]));
+    verifyCalendarConversion(val($x, 'ReminderIsSet') === 'true' && val($x, 'ReminderMinutesBeforeStart') === '15', 'explicit reminder with defaults disabled');
+    $x = convertCalendar(array_replace($base, ['useDefaultAlerts' => $defaultFlag]));
+    verifyCalendarConversion($x->query('/root/t:CalendarItem/t:ReminderIsSet')->length === 0, 'no invented reminder with defaults disabled');
+}
 foreach ([
     ['timeZone' => null], ['timeZone' => ''], ['timeZone' => 'floating'], ['timeZone' => 'Europe/Paris'], ['timeZone' => 'not-a-zone'],
     ['endTimeZone' => 'UTC'], ['start' => '2025-02-30T10:00:00'], ['start' => '2025-03-29'], ['start' => '2025-03-29T10:00:00Z'],
@@ -87,6 +93,8 @@ foreach ([
     ['duration' => 'P1D', 'recurrenceRule' => ['frequency' => 'daily']],
     ['alerts' => ['a' => ['action' => 'display', 'trigger' => ['@type' => 'OffsetTrigger', 'offset' => '-PT30S']]]],
     ['alerts' => ['a' => ['action' => 'email', 'trigger' => ['@type' => 'OffsetTrigger', 'offset' => '-PT15M']]]],
+    ['useDefaultAlerts' => true], ['useDefaultAlerts' => true, 'alerts' => ['a' => ['action' => 'display', 'trigger' => ['@type' => 'OffsetTrigger', 'offset' => '-PT15M']]]],
+    ['useDefaultAlerts' => 'true'], ['useDefaultAlerts' => 0], ['useDefaultAlerts' => []],
     ['status' => 'cancelled'], ['status' => 'tentative'], ['privacy' => 'x-unknown'], ['privacy' => 'secret'],
     ['locations' => ['a' => ['name' => 'A'], 'b' => ['name' => 'B']]], ['locations' => ['a' => ['name' => 'A']], 'mainLocationId' => 'missing'],
     ['participants' => ['p' => ['name' => 'No address']]],
